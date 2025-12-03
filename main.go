@@ -17,13 +17,14 @@ func main() {
 
 	// Configure the server
 	cfg := server.Config{
-		Host:     "0.0.0.0",
-		Port:     5432,
-		DataDir:  "./data",
+		Host:    "0.0.0.0",
+		Port:    5432,
+		DataDir: "./data",
 		Users: map[string]string{
 			"postgres": "postgres", // default user/password
 			"alice":    "alice123",
 			"bob":      "bob123",
+			"eric":     "eric123",
 		},
 	}
 
