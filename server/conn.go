@@ -251,6 +251,9 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 	log.Printf("[%s] Query: %s", c.username, query)
 
+	// Rewrite pg_catalog function calls for compatibility
+	query = rewritePgCatalogQuery(query)
+
 	// Determine command type for proper response
 	upperQuery := strings.ToUpper(query)
 	cmdType := c.getCommandType(upperQuery)
