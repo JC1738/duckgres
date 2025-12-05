@@ -1,5 +1,9 @@
 # Duckgres
 
+<p align="center">
+  <img src="media/oh_duck.png" alt="Duckgres Mascot" width="200">
+</p>
+
 A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any PostgreSQL client (psql, pgAdmin, lib/pq, psycopg2, etc.) and get DuckDB's analytical query performance.
 
 ## Features
