@@ -1068,7 +1068,6 @@ func (c *clientConn) handleDescribe(body []byte) {
 			c.sendError("ERROR", "34000", fmt.Sprintf("portal %q does not exist", name))
 			return
 		}
-		p.described = true
 
 		// For non-SELECT, send NoData
 		upperQuery := strings.ToUpper(strings.TrimSpace(p.stmt.query))
@@ -1105,6 +1104,9 @@ func (c *clientConn) handleDescribe(body []byte) {
 			return
 		}
 
+		// Only mark as described when we actually send RowDescription.
+		// If we sent NoData above, Execute should still send RowDescription.
+		p.described = true
 		c.sendRowDescription(cols, colTypes)
 
 	default:
