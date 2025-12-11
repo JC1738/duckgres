@@ -7,12 +7,20 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"regexp"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
 )
+
+// redactConnectionString removes sensitive information (passwords) from connection strings for logging
+var passwordPattern = regexp.MustCompile(`(?i)(password\s*[=:]\s*)([^\s]+)`)
+
+func redactConnectionString(connStr string) string {
+	return passwordPattern.ReplaceAllString(connStr, "${1}[REDACTED]")
+}
 
 type Config struct {
 	Host    string
@@ -317,10 +325,10 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 		attachStmt = fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake (DATA_PATH '%s')",
 			s.cfg.DuckLake.MetadataStore, s.cfg.DuckLake.ObjectStore)
 		log.Printf("Attaching DuckLake catalog with object store: metadata=%s, data=%s",
-			s.cfg.DuckLake.MetadataStore, s.cfg.DuckLake.ObjectStore)
+			redactConnectionString(s.cfg.DuckLake.MetadataStore), s.cfg.DuckLake.ObjectStore)
 	} else {
 		attachStmt = fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake", s.cfg.DuckLake.MetadataStore)
-		log.Printf("Attaching DuckLake catalog: %s", s.cfg.DuckLake.MetadataStore)
+		log.Printf("Attaching DuckLake catalog: %s", redactConnectionString(s.cfg.DuckLake.MetadataStore))
 	}
 
 	if _, err := db.Exec(attachStmt); err != nil {

@@ -224,3 +224,51 @@ func TestGetCommandType(t *testing.T) {
 		})
 	}
 }
+
+func TestRedactConnectionString(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "postgres connection string with password",
+			input:    "postgres:host=localhost user=postgres password=secretpass dbname=ducklake",
+			expected: "postgres:host=localhost user=postgres password=[REDACTED] dbname=ducklake",
+		},
+		{
+			name:     "connection string with password= format",
+			input:    "host=localhost password=mysecret user=admin",
+			expected: "host=localhost password=[REDACTED] user=admin",
+		},
+		{
+			name:     "connection string with PASSWORD uppercase",
+			input:    "host=localhost PASSWORD=mysecret user=admin",
+			expected: "host=localhost PASSWORD=[REDACTED] user=admin",
+		},
+		{
+			name:     "connection string without password",
+			input:    "host=localhost user=postgres dbname=test",
+			expected: "host=localhost user=postgres dbname=test",
+		},
+		{
+			name:     "empty string",
+			input:    "",
+			expected: "",
+		},
+		{
+			name:     "password with special characters",
+			input:    "host=localhost password=p@ss!word123 user=admin",
+			expected: "host=localhost password=[REDACTED] user=admin",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := redactConnectionString(tt.input)
+			if result != tt.expected {
+				t.Errorf("redactConnectionString(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
