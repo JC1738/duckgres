@@ -280,6 +280,15 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 	log.Printf("[%s] Query: %s", c.username, query)
 
+	// Check if this is a PostgreSQL-specific SET command that should be ignored
+	if isIgnoredSetParameter(query) {
+		log.Printf("[%s] Ignoring PostgreSQL-specific SET: %s", c.username, query)
+		writeCommandComplete(c.writer, "SET")
+		writeReadyForQuery(c.writer, c.txStatus)
+		c.writer.Flush()
+		return nil
+	}
+
 	// Rewrite pg_catalog function calls for compatibility
 	query = rewritePgCatalogQuery(query)
 
@@ -1304,6 +1313,13 @@ func (c *clientConn) handleExecute(body []byte) {
 	returnsResults := queryReturnsResults(p.stmt.query)
 
 	log.Printf("[%s] Execute %q with %d params: %s", c.username, portalName, len(args), p.stmt.query)
+
+	// Check if this is a PostgreSQL-specific SET command that should be ignored
+	if isIgnoredSetParameter(p.stmt.query) {
+		log.Printf("[%s] Ignoring PostgreSQL-specific SET: %s", c.username, p.stmt.query)
+		writeCommandComplete(c.writer, "SET")
+		return
+	}
 
 	if !returnsResults {
 		// Handle nested BEGIN: PostgreSQL issues a warning but continues,
