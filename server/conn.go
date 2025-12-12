@@ -292,6 +292,16 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 	// For non-SELECT queries, use Exec
 	if cmdType != "SELECT" {
+		// Handle nested BEGIN: PostgreSQL issues a warning but continues,
+		// while DuckDB throws an error. Match PostgreSQL behavior.
+		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
+			c.sendNotice("WARNING", "25001", "there is already a transaction in progress")
+			writeCommandComplete(c.writer, "BEGIN")
+			writeReadyForQuery(c.writer, c.txStatus)
+			c.writer.Flush()
+			return nil
+		}
+
 		result, err := c.db.Exec(query)
 		if err != nil {
 			c.sendError("ERROR", "42000", err.Error())
@@ -902,6 +912,11 @@ func (c *clientConn) sendError(severity, code, message string) {
 	c.writer.Flush()
 }
 
+func (c *clientConn) sendNotice(severity, code, message string) {
+	writeNoticeResponse(c.writer, severity, code, message)
+	// Don't flush here - let the caller decide when to flush
+}
+
 // Extended query protocol handlers
 
 func (c *clientConn) handleParse(body []byte) {
@@ -1228,6 +1243,14 @@ func (c *clientConn) handleExecute(body []byte) {
 	log.Printf("[%s] Execute %q with %d params: %s", c.username, portalName, len(args), p.stmt.query)
 
 	if cmdType != "SELECT" {
+		// Handle nested BEGIN: PostgreSQL issues a warning but continues,
+		// while DuckDB throws an error. Match PostgreSQL behavior.
+		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
+			c.sendNotice("WARNING", "25001", "there is already a transaction in progress")
+			writeCommandComplete(c.writer, "BEGIN")
+			return
+		}
+
 		// Non-SELECT: use Exec with converted query
 		result, err := c.db.Exec(p.stmt.convertedQuery, args...)
 		if err != nil {

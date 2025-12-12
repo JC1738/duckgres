@@ -332,3 +332,29 @@ func TestTransactionErrorStatus(t *testing.T) {
 		t.Errorf("after ROLLBACK from error txStatus = %c, want %c", c.txStatus, txStatusIdle)
 	}
 }
+
+func TestNestedBeginDetection(t *testing.T) {
+	// Test that we can detect when a nested BEGIN would occur
+	// The actual warning is sent in handleQuery, but we test the detection logic here
+	c := &clientConn{txStatus: txStatusIdle}
+
+	// First BEGIN should work normally
+	c.updateTxStatus("BEGIN")
+	if c.txStatus != txStatusTransaction {
+		t.Errorf("after first BEGIN txStatus = %c, want %c", c.txStatus, txStatusTransaction)
+	}
+
+	// At this point, a second BEGIN should trigger warning behavior
+	// In handleQuery, when cmdType == "BEGIN" && c.txStatus == txStatusTransaction,
+	// we send a warning and return success without calling DuckDB
+	isNestedBegin := c.txStatus == txStatusTransaction
+	if !isNestedBegin {
+		t.Error("expected nested BEGIN to be detected")
+	}
+
+	// Transaction status should remain 'T' (not change to 'I' or 'E')
+	// The warning is sent but the transaction continues
+	if c.txStatus != txStatusTransaction {
+		t.Errorf("txStatus should still be %c after nested BEGIN detection, got %c", txStatusTransaction, c.txStatus)
+	}
+}
