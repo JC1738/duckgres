@@ -383,6 +383,7 @@ var ignoredSetParameters = map[string]bool{
 	"log_min_messages":             true,
 	"log_min_duration_statement":   true,
 	"log_statement":                true,
+	"extra_float_digits":           true,
 
 	// Transaction settings (DuckDB handles these differently)
 	"default_transaction_isolation":  true,
