@@ -365,7 +365,9 @@ var (
 	// Regex to extract SET parameter name
 	setParameterRegex = regexp.MustCompile(`(?i)^SET\s+(?:SESSION\s+|LOCAL\s+)?(\w+)`)
 	// version() -> PostgreSQL-compatible version string (DuckDB's built-in can't be overridden by macro)
-	versionFuncRegex = regexp.MustCompile(`(?i)\bversion\s*\(\s*\)`)
+	// Two patterns: one for version() with existing AS alias, one for version() without
+	versionFuncWithAliasRegex = regexp.MustCompile(`(?i)\bversion\s*\(\s*\)(\s+AS\s+)`)
+	versionFuncRegex          = regexp.MustCompile(`(?i)\bversion\s*\(\s*\)`)
 )
 
 // PostgreSQL-specific SET parameters that DuckDB doesn't support.
@@ -558,7 +560,10 @@ func rewritePgCatalogQuery(query string) string {
 
 	// Replace version() with PostgreSQL-compatible version string
 	// DuckDB's built-in version() can't be overridden by macros
-	query = versionFuncRegex.ReplaceAllString(query, "'PostgreSQL 15.0 on x86_64-pc-linux-gnu, compiled by gcc, 64-bit (Duckgres/DuckDB)'")
+	// First handle version() with existing AS alias (preserve the alias)
+	query = versionFuncWithAliasRegex.ReplaceAllString(query, "'PostgreSQL 15.0 on x86_64-pc-linux-gnu, compiled by gcc, 64-bit (Duckgres/DuckDB)'$1")
+	// Then handle remaining version() calls (add AS version alias)
+	query = versionFuncRegex.ReplaceAllString(query, "'PostgreSQL 15.0 on x86_64-pc-linux-gnu, compiled by gcc, 64-bit (Duckgres/DuckDB)' AS version")
 
 	return query
 }
