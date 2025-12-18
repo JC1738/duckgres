@@ -32,6 +32,7 @@ func NewSetShowTransform() *SetShowTransform {
 			"idle_session_timeout":                true,
 
 			// Client connection settings
+			"application_name":           true, // Used by clients for identification, not critical
 			"client_min_messages":        true,
 			"log_min_messages":           true,
 			"log_min_duration_statement": true,
@@ -136,7 +137,8 @@ func NewSetShowTransform() *SetShowTransform {
 			"wal_receiver_timeout":      true,
 		},
 		VariableParams: map[string]bool{
-			"application_name": true,
+			// Parameters that need SET VARIABLE syntax in DuckDB
+			// (currently none - application_name is ignored instead)
 		},
 	}
 }
@@ -181,7 +183,18 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 			if n.VariableShowStmt != nil {
 				paramName := strings.ToLower(n.VariableShowStmt.Name)
 
-				// Convert SHOW application_name to SELECT getvariable('application_name')
+				// For ignored params, return a sensible default value
+				if t.IgnoredParams[paramName] {
+					defaultVal := t.getDefaultValue(paramName)
+					selectStmt := t.createDefaultValueSelect(paramName, defaultVal)
+					tree.Stmts[i].Stmt = &pg_query.Node{
+						Node: &pg_query.Node_SelectStmt{SelectStmt: selectStmt},
+					}
+					changed = true
+					continue
+				}
+
+				// Convert SHOW to SELECT getvariable() for variable params
 				if t.VariableParams[paramName] {
 					// Replace with a SELECT statement
 					selectStmt := t.createGetVariableSelect(paramName)
@@ -195,6 +208,48 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 	}
 
 	return changed, nil
+}
+
+// getDefaultValue returns a sensible default value for an ignored parameter
+func (t *SetShowTransform) getDefaultValue(paramName string) string {
+	defaults := map[string]string{
+		"application_name":    "duckgres",
+		"client_encoding":     "UTF8",
+		"statement_timeout":   "0",
+		"lock_timeout":        "0",
+		"extra_float_digits":  "1",
+		"transaction_isolation": "read committed",
+		"synchronous_commit":  "on",
+		"work_mem":            "4MB",
+	}
+	if val, ok := defaults[paramName]; ok {
+		return val
+	}
+	return "" // Empty string for unknown params
+}
+
+// createDefaultValueSelect creates a SELECT 'value' AS name statement
+func (t *SetShowTransform) createDefaultValueSelect(paramName, value string) *pg_query.SelectStmt {
+	return &pg_query.SelectStmt{
+		TargetList: []*pg_query.Node{
+			{
+				Node: &pg_query.Node_ResTarget{
+					ResTarget: &pg_query.ResTarget{
+						Name: paramName,
+						Val: &pg_query.Node{
+							Node: &pg_query.Node_AConst{
+								AConst: &pg_query.A_Const{
+									Val: &pg_query.A_Const_Sval{
+										Sval: &pg_query.String{Sval: value},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
 }
 
 // createGetVariableSelect creates a SELECT getvariable('name') AS name statement

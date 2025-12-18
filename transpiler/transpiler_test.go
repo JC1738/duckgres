@@ -295,14 +295,26 @@ func TestTranspile_SetShow(t *testing.T) {
 		}
 	})
 
-	// Test SHOW application_name conversion
+	// Test SHOW application_name returns default value
 	t.Run("SHOW application_name", func(t *testing.T) {
 		result, err := tr.Transpile("SHOW application_name")
 		if err != nil {
 			t.Fatalf("Transpile error: %v", err)
 		}
-		if !strings.Contains(strings.ToLower(result.SQL), "getvariable") {
-			t.Errorf("SHOW application_name should be converted to getvariable, got: %q", result.SQL)
+		// Should return SELECT 'duckgres' AS application_name
+		if !strings.Contains(result.SQL, "duckgres") {
+			t.Errorf("SHOW application_name should return default value 'duckgres', got: %q", result.SQL)
+		}
+	})
+
+	// Test SET application_name is ignored
+	t.Run("SET application_name ignored", func(t *testing.T) {
+		result, err := tr.Transpile("SET application_name = 'fivetran'")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		if !result.IsIgnoredSet {
+			t.Error("SET application_name should be marked as ignored")
 		}
 	})
 }
