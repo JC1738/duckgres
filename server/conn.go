@@ -323,7 +323,13 @@ func (c *clientConn) handleQuery(body []byte) error {
 	}
 
 	// Use the transpiled SQL
+	originalQuery := query
 	query = result.SQL
+
+	// Log the transpiled query if it differs from the original
+	if query != originalQuery {
+		log.Printf("[%s] Executed: %s", c.username, query)
+	}
 
 	// Determine command type for proper response
 	upperQuery := strings.ToUpper(query)
@@ -1085,6 +1091,9 @@ func (c *clientConn) handleParse(body []byte) {
 	}
 
 	log.Printf("[%s] Prepared statement %q: %s", c.username, stmtName, query)
+	if result.SQL != query {
+		log.Printf("[%s] Prepared statement %q transpiled: %s", c.username, stmtName, result.SQL)
+	}
 	writeParseComplete(c.writer)
 }
 
