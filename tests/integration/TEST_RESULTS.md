@@ -5,9 +5,26 @@
 
 ## Summary
 
-The integration test suite validates Duckgres compatibility with PostgreSQL for OLAP workloads.
+The integration test suite validates Duckgres compatibility with PostgreSQL for OLAP workloads. Tests run against **DuckLake by default** (DuckDB + PostgreSQL metadata + MinIO object storage).
 
-### Overall Results
+### Test Modes
+
+| Mode | Description | Pass Rate |
+|------|-------------|-----------|
+| **DuckLake** (default) | Full DuckLake with PostgreSQL metadata + MinIO | 53% |
+| **Vanilla DuckDB** | In-memory DuckDB without DuckLake | 76% |
+
+To run without DuckLake: `DUCKGRES_TEST_NO_DUCKLAKE=1 go test ./tests/integration/...`
+
+### Overall Results (DuckLake Mode)
+
+| Metric | Count |
+|--------|-------|
+| **PASS** | 48 |
+| **FAIL** | 42 |
+| **Pass Rate** | 53% |
+
+### Overall Results (Vanilla DuckDB Mode)
 
 | Metric | Count |
 |--------|-------|
@@ -16,7 +33,7 @@ The integration test suite validates Duckgres compatibility with PostgreSQL for 
 | **SKIP** | 18 |
 | **Pass Rate** | 76% |
 
-### Results by Category
+### Results by Category (Vanilla DuckDB)
 
 | Category | Tests | Passed | Failed | Pass Rate |
 |----------|-------|--------|--------|-----------|
@@ -40,7 +57,40 @@ The integration test suite validates Duckgres compatibility with PostgreSQL for 
 | **Functions** | ~180 | ~130 | ~50 | ~72% |
 | **Types** | ~80 | ~60 | ~20 | ~75% |
 
-## Passing Test Categories
+## DuckLake Mode
+
+DuckLake mode is enabled by default because it better represents production usage. DuckLake stores table metadata in PostgreSQL and data files as Parquet in S3-compatible storage (MinIO).
+
+### DuckLake Infrastructure
+
+The test infrastructure includes:
+- **PostgreSQL** (port 35432): For comparison testing against real PostgreSQL
+- **DuckLake Metadata PostgreSQL** (port 35433): Stores DuckLake catalog metadata
+- **MinIO** (port 39000): S3-compatible object storage for Parquet files
+
+### DuckLake-Specific Limitations
+
+DuckLake has additional constraints compared to vanilla DuckDB:
+
+1. **No RETURNING clause** - `INSERT/UPDATE/DELETE ... RETURNING` not supported
+2. **Limited DEFAULT values** - Only numeric and string literals (no `DEFAULT true`, `DEFAULT now()`)
+3. **No PRIMARY KEY/UNIQUE/FOREIGN KEY** - Constraints are stripped by the DDL transform
+4. **No SERIAL types** - Converted to INTEGER types
+5. **No CREATE INDEX** - Indexes are no-ops in DuckLake
+
+### Passing Categories in DuckLake Mode
+
+| Category | Pass Rate |
+|----------|-----------|
+| pg_catalog Compatibility | 100% |
+| information_schema | 100% |
+| DDL (with constraint stripping) | ~70% |
+| DML (without RETURNING) | ~60% |
+| Window Functions | 100% |
+| CTEs | 100% |
+| Set Operations | 100% |
+
+## Passing Test Categories (Vanilla DuckDB)
 
 ### pg_catalog Compatibility (100%)
 All pg_catalog views and functions work correctly:
@@ -142,11 +192,16 @@ The SHOW command is not fully supported for all PostgreSQL configuration paramet
 
 **Workaround**: Use `SELECT current_setting('server_version')` instead
 
-### 6. Prepared Statement Protocol
-The extended query protocol (Parse/Bind/Describe/Execute) has timing issues with the 'T' (RowDescription) message.
+### 6. RETURNING Clause (DuckLake)
+DuckLake does not support `INSERT/UPDATE/DELETE ... RETURNING`.
 
-### 7. Per-Connection Database
+**Impact**: Tests using RETURNING clause fail in DuckLake mode
+**Workaround**: Use separate SELECT after mutation
+
+### 7. Per-Connection Database (Vanilla DuckDB)
 Each new database connection gets a fresh in-memory DuckDB database. This is by design but affects tests requiring data persistence across connections.
+
+**Note**: This is not an issue in DuckLake mode where metadata persists.
 
 ## Fixes Applied
 
@@ -154,12 +209,17 @@ Each new database connection gets a fresh in-memory DuckDB database. This is by 
 - **Timestamp formatting** (`server/conn.go`): Format timestamps as `2006-01-02 15:04:05` instead of Go's default `2024-01-01 10:00:00 +0000 UTC`
 - **Prepared statement protocol** (`server/conn.go`): Fixed duplicate RowDescription during Execute when Describe(S) was called - now tracks statement describe state and propagates to portals
 
+### DDL Transform Fixes (DuckLake)
+- **Strip boolean defaults** (`transpiler/transform/ddl.go`): DuckLake only supports numeric/string literal defaults
+- **Strip all constraints** (`transpiler/transform/ddl.go`): PRIMARY KEY, UNIQUE, FOREIGN KEY, CHECK
+
 ### Test Harness Fixes
 - **`compare.go`**: Use `sql.RawBytes` to avoid driver parsing issues
 - **`compare.go`**: Add `IgnoreColumnNames` option (DuckDB names anonymous columns differently)
 - **`compare.go`**: Add `IgnoreRowOrder` option (row order undefined without ORDER BY)
 - **`compare.go`**: Fix numeric and time comparison in row sorting
 - **`harness.go`**: Strip SQL comments before statement splitting
+- **`harness.go`**: Add DuckLake cleanup before loading fixtures
 - **`fixtures/schema.sql`**: Remove JSON columns (transpiler issue)
 - **`fixtures/data.sql`**: Fix invalid UUID
 
@@ -183,23 +243,42 @@ xcode-select --install
 
 ## Running Tests
 
+### With DuckLake (Default)
+
 ```bash
-# Start PostgreSQL container
+# Start all infrastructure (PostgreSQL + DuckLake metadata + MinIO)
 docker compose -f tests/integration/docker-compose.yml up -d
 
-# Wait for PostgreSQL to be ready
-sleep 5
+# Wait for services to be ready
+sleep 10
 
 # Run all tests
 go test ./tests/integration/... -v
 
+# Stop infrastructure
+docker compose -f tests/integration/docker-compose.yml down -v
+```
+
+### Without DuckLake (Vanilla DuckDB)
+
+```bash
+# Start only PostgreSQL for comparison
+docker compose -f tests/integration/docker-compose.yml up -d postgres
+
+# Run tests in vanilla DuckDB mode
+DUCKGRES_TEST_NO_DUCKLAKE=1 go test ./tests/integration/... -v
+
+# Stop PostgreSQL
+docker compose -f tests/integration/docker-compose.yml down -v
+```
+
+### Run Specific Tests
+
+```bash
 # Run specific test categories
 go test ./tests/integration/... -v -run "TestCatalog"
 go test ./tests/integration/... -v -run "TestDQL"
 go test ./tests/integration/clients/... -v -run "TestGrafana"
-
-# Stop PostgreSQL container
-docker compose -f tests/integration/docker-compose.yml down -v
 ```
 
 ## Recommendations for Improving Compatibility
@@ -208,7 +287,7 @@ docker compose -f tests/integration/docker-compose.yml down -v
 2. **Add `SHOW server_version` support** for DBeaver compatibility
 3. **Transpile regex operators** (`~`, `~*`) to `regexp_matches()`
 4. **Handle integer division** to match PostgreSQL behavior
-5. **Review extended query protocol** for prepared statement support
+5. **Add RETURNING emulation** for DuckLake mode (separate SELECT)
 
 ## CI Configuration
 
@@ -219,4 +298,12 @@ For GitHub Actions, add these dependencies to your workflow:
   run: |
     sudo apt-get update
     sudo apt-get install -y g++
+
+- name: Start test infrastructure
+  run: |
+    docker compose -f tests/integration/docker-compose.yml up -d
+    sleep 10
+
+- name: Run integration tests
+  run: go test ./tests/integration/... -v
 ```
