@@ -297,11 +297,6 @@ func (t *DDLTransform) isUnsupportedDefault(expr *pg_query.Node) bool {
 		}
 	}
 
-	// TypeCast (e.g., 'value'::type)
-	if expr.GetTypeCast() != nil {
-		return true
-	}
-
 	// Column references, expressions, etc. are not supported
 	return true
 }
