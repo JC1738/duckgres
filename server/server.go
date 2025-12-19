@@ -330,19 +330,27 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 		return nil // DuckLake not configured
 	}
 
-	// Serialize DuckLake attachment to avoid race conditions
-	// Multiple connections trying to attach simultaneously can cause
+	// Fast path: check if DuckLake is already attached (no mutex needed)
+	// This avoids blocking on the mutex for the common case where DuckLake
+	// was already attached by an earlier connection.
+	var count int
+	err := db.QueryRow("SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'ducklake'").Scan(&count)
+	if err == nil && count > 0 {
+		// Already attached, just set as default
+		if _, err := db.Exec("USE ducklake"); err != nil {
+			return fmt.Errorf("failed to set DuckLake as default catalog: %w", err)
+		}
+		return nil
+	}
+
+	// Slow path: need to attach DuckLake. Serialize to avoid race conditions
+	// where multiple connections try to attach simultaneously, causing
 	// "database with name '__ducklake_metadata_ducklake' already exists" errors
-	//
-	// TODO: This mutex can block all incoming connections if DuckLake attachment
-	// is slow (e.g., network latency to metadata store). Consider adding a timeout
-	// or moving attachment to happen asynchronously after connection establishment.
 	s.duckLakeMu.Lock()
 	defer s.duckLakeMu.Unlock()
 
-	// Check if DuckLake catalog is already attached
-	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'ducklake'").Scan(&count)
+	// Double-check after acquiring mutex (another goroutine may have attached)
+	err = db.QueryRow("SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'ducklake'").Scan(&count)
 	if err == nil && count > 0 {
 		// Already attached, just set as default
 		if _, err := db.Exec("USE ducklake"); err != nil {
