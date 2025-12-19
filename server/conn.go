@@ -1026,6 +1026,16 @@ func formatValue(v interface{}) string {
 			return "t"
 		}
 		return "f"
+	case time.Time:
+		// PostgreSQL timestamp format without timezone suffix
+		if val.IsZero() {
+			return ""
+		}
+		// Use microsecond precision if there are sub-second components
+		if val.Nanosecond() != 0 {
+			return val.Format("2006-01-02 15:04:05.999999")
+		}
+		return val.Format("2006-01-02 15:04:05")
 	default:
 		// For other types, try to convert to string
 		return fmt.Sprintf("%v", val)

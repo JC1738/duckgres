@@ -29,6 +29,8 @@ type CompareOptions struct {
 	IgnoreColumnOrder bool
 	// IgnoreRowOrder ignores the order of rows (compare as sets)
 	IgnoreRowOrder bool
+	// IgnoreColumnNames ignores column name differences (only compare data)
+	IgnoreColumnNames bool
 	// FloatTolerance is the tolerance for floating point comparisons
 	FloatTolerance float64
 	// TimeTolerance is the tolerance for timestamp comparisons
@@ -48,6 +50,7 @@ func DefaultCompareOptions() CompareOptions {
 	return CompareOptions{
 		IgnoreColumnOrder: false,
 		IgnoreRowOrder:    false,
+		IgnoreColumnNames: true, // DuckDB names anonymous columns differently than PostgreSQL
 		FloatTolerance:    1e-9,
 		TimeTolerance:     time.Microsecond,
 		IgnoreCase:        false,
@@ -79,20 +82,24 @@ func ExecuteQuery(db *sql.DB, query string) (*QueryResult, error) {
 
 	var result [][]interface{}
 	for rows.Next() {
-		values := make([]interface{}, len(columns))
+		// Use sql.RawBytes to completely avoid driver parsing issues
+		rawValues := make([]sql.RawBytes, len(columns))
 		valuePtrs := make([]interface{}, len(columns))
-		for i := range values {
-			valuePtrs[i] = &values[i]
+		for i := range rawValues {
+			valuePtrs[i] = &rawValues[i]
 		}
 
 		if err := rows.Scan(valuePtrs...); err != nil {
 			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
 
-		// Convert []byte to string for easier comparison
-		for i, v := range values {
-			if b, ok := v.([]byte); ok {
-				values[i] = string(b)
+		// Convert RawBytes to appropriate types
+		values := make([]interface{}, len(columns))
+		for i := range rawValues {
+			if rawValues[i] == nil {
+				values[i] = nil
+			} else {
+				values[i] = parseValue(string(rawValues[i]))
 			}
 		}
 
@@ -107,6 +114,61 @@ func ExecuteQuery(db *sql.DB, query string) (*QueryResult, error) {
 		Columns: columns,
 		Rows:    result,
 	}, nil
+}
+
+// parseValue attempts to parse a string value into an appropriate Go type
+func parseValue(s string) interface{} {
+	// Empty string
+	if s == "" {
+		return ""
+	}
+
+	// Boolean
+	if s == "t" || s == "true" || s == "TRUE" {
+		return true
+	}
+	if s == "f" || s == "false" || s == "FALSE" {
+		return false
+	}
+
+	// Integer - only if the string is purely numeric
+	var i int64
+	if _, err := fmt.Sscanf(s, "%d", &i); err == nil && fmt.Sprintf("%d", i) == s {
+		return i
+	}
+
+	// Float - only if it contains decimal point or scientific notation
+	if strings.Contains(s, ".") || strings.ContainsAny(s, "eE") {
+		var f float64
+		if _, err := fmt.Sscanf(s, "%f", &f); err == nil {
+			return f
+		}
+	}
+
+	// Timestamp formats - try multiple layouts
+	timestampLayouts := []string{
+		"2006-01-02 15:04:05.999999-07",
+		"2006-01-02 15:04:05.999999+00",
+		"2006-01-02 15:04:05.999999",
+		"2006-01-02 15:04:05-07",
+		"2006-01-02 15:04:05+00",
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04:05 -0700 MST",
+		"2006-01-02 15:04:05 +0000 UTC",
+		"2006-01-02T15:04:05Z",
+		"2006-01-02T15:04:05.999999Z",
+		"2006-01-02",
+		"15:04:05",
+		"15:04:05.999999",
+	}
+	for _, layout := range timestampLayouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t
+		}
+	}
+
+	// Return as string if no other type matched
+	return s
 }
 
 // CompareQueries executes a query on both databases and compares results
@@ -169,22 +231,24 @@ func compareResults(pg, dg *QueryResult, opts CompareOptions) (bool, []string) {
 		return false, diffs
 	}
 
-	// Compare column names
-	pgCols := pg.Columns
-	dgCols := dg.Columns
-	if opts.IgnoreColumnOrder {
-		pgCols = sortedCopy(pgCols)
-		dgCols = sortedCopy(dgCols)
-	}
-	for i := range pgCols {
-		pgCol := pgCols[i]
-		dgCol := dgCols[i]
-		if opts.IgnoreCase {
-			pgCol = strings.ToLower(pgCol)
-			dgCol = strings.ToLower(dgCol)
+	// Compare column names (skip if IgnoreColumnNames is set)
+	if !opts.IgnoreColumnNames {
+		pgCols := pg.Columns
+		dgCols := dg.Columns
+		if opts.IgnoreColumnOrder {
+			pgCols = sortedCopy(pgCols)
+			dgCols = sortedCopy(dgCols)
 		}
-		if pgCol != dgCol {
-			diffs = append(diffs, fmt.Sprintf("Column name mismatch at position %d: PostgreSQL=%q, Duckgres=%q", i, pg.Columns[i], dg.Columns[i]))
+		for i := range pgCols {
+			pgCol := pgCols[i]
+			dgCol := dgCols[i]
+			if opts.IgnoreCase {
+				pgCol = strings.ToLower(pgCol)
+				dgCol = strings.ToLower(dgCol)
+			}
+			if pgCol != dgCol {
+				diffs = append(diffs, fmt.Sprintf("Column name mismatch at position %d: PostgreSQL=%q, Duckgres=%q", i, pg.Columns[i], dg.Columns[i]))
+			}
 		}
 	}
 
