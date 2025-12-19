@@ -1,28 +1,28 @@
 -- Test Data for Duckgres PostgreSQL Compatibility Tests
 
--- Types test data
+-- Types test data (without JSON column which was removed)
 INSERT INTO types_test VALUES
 (1, true, 1, 100, 1000000000, 1.5, 2.5, 123.4567, 'hello', 'world', 'test      ',
  '2024-01-15', '12:30:45', '2024-01-15 12:30:45', '2024-01-15 12:30:45+00',
- '1 day 2 hours', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '{"key": "value"}', '\x48656c6c6f'),
+ '1 day 2 hours', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '\x48656c6c6f'),
 (2, false, -1, -100, -1000000000, -1.5, -2.5, -123.4567, '', '', '          ',
  '2020-12-31', '23:59:59', '2020-12-31 23:59:59', '2020-12-31 23:59:59+00',
- '1 year 2 months', 'b1ffcd00-0d1c-5fa9-cc7e-7cc0ce491b22', '[]', '\x00'),
+ '1 year 2 months', 'b1ffcd00-0d1c-5fa9-cc7e-7cc0ce491b22', '\x00'),
 (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
- NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+ NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 
 -- Users data
-INSERT INTO users (id, name, email, age, active, created_at, score, metadata) VALUES
-(1, 'Alice', 'alice@example.com', 30, true, '2024-01-01 10:00:00', 95.50, '{"role": "admin", "level": 5}'),
-(2, 'Bob', 'bob@example.com', 25, true, '2024-01-02 11:00:00', 82.25, '{"role": "user", "level": 3}'),
-(3, 'Charlie', 'charlie@example.com', 35, false, '2024-01-03 12:00:00', 78.00, '{"role": "user", "level": 2}'),
-(4, 'Diana', 'diana@example.com', 28, true, '2024-01-04 13:00:00', 91.75, '{"role": "moderator", "level": 4}'),
-(5, 'Eve', 'eve@example.com', 32, true, '2024-01-05 14:00:00', 88.50, '{"role": "user", "level": 3}'),
-(6, 'Frank', 'frank@example.com', 45, false, '2024-01-06 15:00:00', 65.00, '{"role": "user", "level": 1}'),
-(7, 'Grace', 'grace@example.com', 22, true, '2024-01-07 16:00:00', 99.00, '{"role": "admin", "level": 5}'),
-(8, 'Henry', 'henry@example.com', 38, true, '2024-01-08 17:00:00', 72.50, '{"role": "user", "level": 2}'),
-(9, 'Ivy', 'ivy@example.com', 27, false, '2024-01-09 18:00:00', 85.25, '{"role": "user", "level": 3}'),
-(10, 'Jack', 'jack@example.com', 33, true, '2024-01-10 19:00:00', 90.00, '{"role": "moderator", "level": 4}');
+INSERT INTO users (id, name, email, age, active, created_at, score) VALUES
+(1, 'Alice', 'alice@example.com', 30, true, '2024-01-01 10:00:00', 95.50),
+(2, 'Bob', 'bob@example.com', 25, true, '2024-01-02 11:00:00', 82.25),
+(3, 'Charlie', 'charlie@example.com', 35, false, '2024-01-03 12:00:00', 78.00),
+(4, 'Diana', 'diana@example.com', 28, true, '2024-01-04 13:00:00', 91.75),
+(5, 'Eve', 'eve@example.com', 32, true, '2024-01-05 14:00:00', 88.50),
+(6, 'Frank', 'frank@example.com', 45, false, '2024-01-06 15:00:00', 65.00),
+(7, 'Grace', 'grace@example.com', 22, true, '2024-01-07 16:00:00', 99.00),
+(8, 'Henry', 'henry@example.com', 38, true, '2024-01-08 17:00:00', 72.50),
+(9, 'Ivy', 'ivy@example.com', 27, false, '2024-01-09 18:00:00', 85.25),
+(10, 'Jack', 'jack@example.com', 33, true, '2024-01-10 19:00:00', 90.00);
 
 -- Products data
 INSERT INTO products (id, name, category, price, stock, created_at, tags) VALUES

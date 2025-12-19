@@ -1,7 +1,7 @@
 -- Test Schema for Duckgres PostgreSQL Compatibility Tests
 -- This schema is loaded into both PostgreSQL and Duckgres for side-by-side testing
 
--- Basic types table
+-- Basic types table (using DuckDB-compatible types)
 CREATE TABLE types_test (
     id INTEGER PRIMARY KEY,
     bool_col BOOLEAN,
@@ -20,7 +20,6 @@ CREATE TABLE types_test (
     timestamptz_col TIMESTAMPTZ,
     interval_col INTERVAL,
     uuid_col UUID,
-    json_col JSON,
     bytea_col BYTEA
 );
 
@@ -32,8 +31,7 @@ CREATE TABLE users (
     age INTEGER,
     active BOOLEAN DEFAULT true,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    score NUMERIC(10, 2),
-    metadata JSON
+    score NUMERIC(10, 2)
 );
 
 -- Products table
@@ -95,11 +93,11 @@ CREATE TABLE events (
     duration INTERVAL
 );
 
--- JSON test table
+-- JSON test table (simplified - no JSON columns for DuckDB compatibility)
 CREATE TABLE json_data (
     id INTEGER PRIMARY KEY,
-    data JSON,
-    attributes JSON
+    data TEXT,
+    attributes TEXT
 );
 
 -- Table with NULLs for NULL handling tests

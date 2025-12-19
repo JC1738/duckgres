@@ -338,9 +338,26 @@ func splitSQLStatements(sql string) []string {
 	var current strings.Builder
 	inString := false
 	stringChar := byte(0)
+	inLineComment := false
 
 	for i := 0; i < len(sql); i++ {
 		c := sql[i]
+
+		// Handle line comments (--) when not in a string
+		if !inString && !inLineComment && c == '-' && i+1 < len(sql) && sql[i+1] == '-' {
+			inLineComment = true
+			i++ // skip second dash
+			continue
+		}
+
+		// End line comment on newline
+		if inLineComment {
+			if c == '\n' {
+				inLineComment = false
+				current.WriteByte(' ') // replace comment with space
+			}
+			continue
+		}
 
 		// Handle string literals
 		if (c == '\'' || c == '"') && (i == 0 || sql[i-1] != '\\') {
