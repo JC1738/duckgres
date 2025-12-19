@@ -88,6 +88,12 @@ func (c *clientConn) serve() error {
 	// Ensure the database connection is closed when this client disconnects
 	defer func() {
 		if c.db != nil {
+			// Detach DuckLake to release the RDS metadata connection
+			if c.server.cfg.DuckLake.MetadataStore != "" {
+				if _, err := c.db.Exec("DETACH ducklake"); err != nil {
+					log.Printf("Warning: failed to detach DuckLake for user %q: %v", c.username, err)
+				}
+			}
 			c.db.Close()
 			log.Printf("Closed DuckDB connection for user %q", c.username)
 		}
