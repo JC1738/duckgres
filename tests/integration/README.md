@@ -38,6 +38,18 @@ The test suite runs queries against both a real PostgreSQL 16 instance and Duckg
 
 - Go 1.21+
 - Docker and Docker Compose
+- GCC C++ compiler (for DuckDB native bindings - provides libstdc++ for linking)
+
+```bash
+# Fedora/RHEL
+sudo dnf install gcc-c++
+
+# Ubuntu/Debian
+sudo apt install g++
+
+# macOS (included with Xcode Command Line Tools)
+xcode-select --install
+```
 
 ### Running Tests
 

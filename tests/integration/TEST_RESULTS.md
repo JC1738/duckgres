@@ -6,7 +6,7 @@
 
 ### Environment Issue
 
-The tests require `libstdc++` (C++ standard library) to be installed for linking with DuckDB's native bindings. This is the same requirement as the main Duckgres project.
+The tests require the GCC C++ compiler to be installed for linking with DuckDB's native bindings. This provides the `libstdc++.so` symlink needed by the linker.
 
 ```
 /usr/bin/ld: cannot find -lstdc++: No such file or directory
@@ -14,14 +14,14 @@ The tests require `libstdc++` (C++ standard library) to be installed for linking
 
 ### Fix
 
-Install the C++ development package for your distribution:
+Install the GCC C++ compiler for your distribution:
 
 ```bash
 # Fedora/RHEL
-sudo dnf install libstdc++-devel
+sudo dnf install gcc-c++
 
 # Ubuntu/Debian
-sudo apt install libstdc++-dev
+sudo apt install g++
 
 # macOS (usually included with Xcode Command Line Tools)
 xcode-select --install
