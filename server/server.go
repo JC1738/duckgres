@@ -94,6 +94,12 @@ type Server struct {
 	// duckLakeSem serializes DuckLake attachment to avoid write-write conflicts.
 	// Using a channel instead of mutex allows for timeout on acquisition.
 	duckLakeSem chan struct{}
+
+	// dbPool caches sql.DB connections per database file to avoid DuckDB file locking
+	// issues from rapid open/close cycles. Connections are created on first use and
+	// kept open for the server lifetime.
+	dbPool   map[string]*sql.DB
+	dbPoolMu sync.Mutex
 }
 
 func New(cfg Config) (*Server, error) {
@@ -129,6 +135,7 @@ func New(cfg Config) (*Server, error) {
 			Certificates: []tls.Certificate{cert},
 		},
 		duckLakeSem: make(chan struct{}, 1),
+		dbPool:      make(map[string]*sql.DB),
 	}
 
 	log.Printf("TLS enabled with certificate: %s", cfg.TLSCertFile)
@@ -248,33 +255,65 @@ func (s *Server) ActiveConnections() int64 {
 	return atomic.LoadInt64(&s.activeConns)
 }
 
-// createDBConnection creates a new DuckDB connection for a client session.
-// Each client connection gets its own DB connection to ensure proper isolation
-// of temporary tables and session state, matching PostgreSQL's behavior.
-func (s *Server) createDBConnection(username string) (*sql.DB, error) {
-	dbPath := fmt.Sprintf("%s/%s.db", s.cfg.DataDir, username)
+// getDBConnection returns a DuckDB connection for a client session.
+// Connections are pooled per database file to avoid DuckDB file locking issues
+// from rapid open/close cycles. The connection is shared across all clients
+// using the same database file.
+func (s *Server) getDBConnection(username string) (*sql.DB, error) {
+	// Use in-memory database when DuckLake is configured (data lives in RDS/S3),
+	// otherwise use file-based database for local storage.
+	var dbPath string
+	if s.cfg.DuckLake.MetadataStore != "" {
+		dbPath = ":memory:"
+	} else {
+		dbPath = fmt.Sprintf("%s/%s.db", s.cfg.DataDir, username)
+	}
+
+	// Check if we already have a connection for this database
+	poolKey := fmt.Sprintf("%s:%s", username, dbPath)
+	s.dbPoolMu.Lock()
+	if db, ok := s.dbPool[poolKey]; ok {
+		s.dbPoolMu.Unlock()
+		// Verify connection is still alive
+		if err := db.Ping(); err == nil {
+			log.Printf("[%s] Reusing pooled DuckDB connection", username)
+			return db, nil
+		}
+		// Connection is dead, remove from pool and create new one
+		log.Printf("[%s] Pooled connection dead, creating new one", username)
+		s.dbPoolMu.Lock()
+		delete(s.dbPool, poolKey)
+	}
+	s.dbPoolMu.Unlock()
+
+	// Create new connection
+	log.Printf("[%s] Opening DuckDB at %s", username, dbPath)
 	db, err := sql.Open("duckdb", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open duckdb: %w", err)
 	}
 
-	// Limit the connection pool to a single connection per client session.
-	// This prevents resource exhaustion from too many DuckDB connections.
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+	// Configure connection pool - allow multiple concurrent queries since
+	// this connection is shared across all clients for this database
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(30 * time.Minute)
 
 	// Verify connection
+	log.Printf("[%s] Pinging DuckDB...", username)
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to ping duckdb: %w", err)
 	}
+	log.Printf("[%s] Ping successful", username)
 
 	// Load configured extensions
+	log.Printf("[%s] Loading extensions...", username)
 	if err := s.loadExtensions(db); err != nil {
 		log.Printf("Warning: failed to load some extensions for user %q: %v", username, err)
 		// Continue anyway - database will still work without the extensions
 	}
+	log.Printf("[%s] Extensions loaded", username)
 
 	// Attach DuckLake catalog if configured
 	if err := s.attachDuckLake(db); err != nil {
@@ -294,7 +333,12 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 		// Continue anyway - basic queries will still work
 	}
 
-	log.Printf("Opened DuckDB connection for user %q at %s", username, dbPath)
+	// Add to pool
+	s.dbPoolMu.Lock()
+	s.dbPool[poolKey] = db
+	s.dbPoolMu.Unlock()
+
+	log.Printf("[%s] Created new pooled DuckDB connection at %s", username, dbPath)
 	return db, nil
 }
 
@@ -337,9 +381,14 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 	// "database with name '__ducklake_metadata_ducklake' already exists".
 	// Use a 30-second timeout to prevent connections from hanging indefinitely
 	// if attachment is slow (e.g., network latency to metadata store).
+	log.Printf("Waiting for DuckLake attachment lock...")
 	select {
 	case s.duckLakeSem <- struct{}{}:
-		defer func() { <-s.duckLakeSem }()
+		log.Printf("Acquired DuckLake attachment lock")
+		defer func() {
+			<-s.duckLakeSem
+			log.Printf("Released DuckLake attachment lock")
+		}()
 	case <-time.After(30 * time.Second):
 		return fmt.Errorf("timeout waiting for DuckLake attachment lock")
 	}
