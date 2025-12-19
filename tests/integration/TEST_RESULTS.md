@@ -11,10 +11,10 @@ The integration test suite validates Duckgres compatibility with PostgreSQL for 
 
 | Metric | Count |
 |--------|-------|
-| **PASS** | 543 |
-| **FAIL** | 187 |
+| **PASS** | 622 |
+| **FAIL** | 200 |
 | **SKIP** | 18 |
-| **Pass Rate** | 73% |
+| **Pass Rate** | 76% |
 
 ### Results by Category
 
@@ -32,6 +32,8 @@ The integration test suite validates Duckgres compatibility with PostgreSQL for 
 | **dbt Queries** | 7 | 7 | 0 | 100% |
 | **Metabase Queries** | 5 | 4 | 1 | 80% |
 | **DBeaver Queries** | 4 | 3 | 1 | 75% |
+| **Prepared Statements** | 3 | 3 | 0 | 100% |
+| **Transactions** | 2 | 2 | 0 | 100% |
 | **DQL (SELECT)** | ~160 | ~110 | ~50 | ~69% |
 | **DML (INSERT/UPDATE/DELETE)** | ~45 | ~35 | ~10 | ~78% |
 | **DDL (CREATE/ALTER/DROP)** | ~50 | ~40 | ~10 | ~80% |
@@ -148,8 +150,9 @@ Each new database connection gets a fresh in-memory DuckDB database. This is by 
 
 ## Fixes Applied
 
-### Wire Protocol Fix
+### Wire Protocol Fixes
 - **Timestamp formatting** (`server/conn.go`): Format timestamps as `2006-01-02 15:04:05` instead of Go's default `2024-01-01 10:00:00 +0000 UTC`
+- **Prepared statement protocol** (`server/conn.go`): Fixed duplicate RowDescription during Execute when Describe(S) was called - now tracks statement describe state and propagates to portals
 
 ### Test Harness Fixes
 - **`compare.go`**: Use `sql.RawBytes` to avoid driver parsing issues
