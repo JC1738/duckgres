@@ -43,6 +43,11 @@ type Config struct {
 
 	// Graceful shutdown timeout (default: 30s)
 	ShutdownTimeout time.Duration
+
+	// IdleTimeout is the maximum time a connection can be idle before being closed.
+	// This prevents accumulation of zombie connections from clients that disconnect
+	// uncleanly. Default: 10 minutes. Set to 0 to disable.
+	IdleTimeout time.Duration
 }
 
 // DuckLakeConfig configures DuckLake catalog attachment
@@ -86,8 +91,9 @@ type Server struct {
 	closeMu     sync.Mutex
 	activeConns int64 // atomic counter for active connections
 
-	// duckLakeMu serializes DuckLake secret creation to avoid write-write conflicts
-	duckLakeMu sync.Mutex
+	// duckLakeSem serializes DuckLake attachment to avoid write-write conflicts.
+	// Using a channel instead of mutex allows for timeout on acquisition.
+	duckLakeSem chan struct{}
 }
 
 func New(cfg Config) (*Server, error) {
@@ -111,12 +117,18 @@ func New(cfg Config) (*Server, error) {
 		cfg.ShutdownTimeout = 30 * time.Second
 	}
 
+	// Use default idle timeout if not specified (10 minutes)
+	if cfg.IdleTimeout == 0 {
+		cfg.IdleTimeout = 10 * time.Minute
+	}
+
 	s := &Server{
 		cfg:         cfg,
 		rateLimiter: NewRateLimiter(cfg.RateLimit),
 		tlsConfig: &tls.Config{
 			Certificates: []tls.Certificate{cert},
 		},
+		duckLakeSem: make(chan struct{}, 1),
 	}
 
 	log.Printf("TLS enabled with certificate: %s", cfg.TLSCertFile)
@@ -144,6 +156,12 @@ func (s *Server) ListenAndServe() error {
 			}
 			log.Printf("Accept error: %v", err)
 			continue
+		}
+
+		// Enable TCP keepalive to detect dead connections
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			tcpConn.SetKeepAlive(true)
+			tcpConn.SetKeepAlivePeriod(30 * time.Second)
 		}
 
 		s.wg.Add(1)
@@ -230,15 +248,18 @@ func (s *Server) ActiveConnections() int64 {
 	return atomic.LoadInt64(&s.activeConns)
 }
 
-// createDBConnection creates a new DuckDB connection for a client session.
-// Each client connection gets its own DB connection to ensure proper isolation
-// of temporary tables and session state, matching PostgreSQL's behavior.
+// createDBConnection creates a DuckDB connection for a client session.
+// Uses in-memory database as an anchor for DuckLake attachment (actual data lives in RDS/S3).
 func (s *Server) createDBConnection(username string) (*sql.DB, error) {
-	dbPath := fmt.Sprintf("%s/%s.db", s.cfg.DataDir, username)
-	db, err := sql.Open("duckdb", dbPath)
+	// Create new in-memory connection (DuckLake provides actual storage)
+	db, err := sql.Open("duckdb", ":memory:")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open duckdb: %w", err)
 	}
+
+	// Single connection per client session
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 
 	// Verify connection
 	if err := db.Ping(); err != nil {
@@ -249,7 +270,6 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 	// Load configured extensions
 	if err := s.loadExtensions(db); err != nil {
 		log.Printf("Warning: failed to load some extensions for user %q: %v", username, err)
-		// Continue anyway - database will still work without the extensions
 	}
 
 	// Attach DuckLake catalog if configured
@@ -270,7 +290,6 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 		// Continue anyway - basic queries will still work
 	}
 
-	log.Printf("Opened DuckDB connection for user %q at %s", username, dbPath)
 	return db, nil
 }
 
@@ -308,11 +327,17 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 		return nil // DuckLake not configured
 	}
 
-	// Serialize DuckLake attachment to avoid race conditions
-	// Multiple connections trying to attach simultaneously can cause
-	// "database with name '__ducklake_metadata_ducklake' already exists" errors
-	s.duckLakeMu.Lock()
-	defer s.duckLakeMu.Unlock()
+	// Serialize DuckLake attachment to avoid race conditions where multiple
+	// connections try to attach simultaneously, causing errors like
+	// "database with name '__ducklake_metadata_ducklake' already exists".
+	// Use a 30-second timeout to prevent connections from hanging indefinitely
+	// if attachment is slow (e.g., network latency to metadata store).
+	select {
+	case s.duckLakeSem <- struct{}{}:
+		defer func() { <-s.duckLakeSem }()
+	case <-time.After(30 * time.Second):
+		return fmt.Errorf("timeout waiting for DuckLake attachment lock")
+	}
 
 	// Check if DuckLake catalog is already attached
 	var count int
@@ -376,7 +401,7 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 //   - "config": explicit credentials (for MinIO or when you have access keys)
 //   - "credential_chain": AWS SDK credential chain (env vars, config files, instance metadata, etc.)
 //
-// Note: Caller must hold duckLakeMu to avoid race conditions.
+// Note: Caller must hold duckLakeSem to avoid race conditions.
 // See: https://duckdb.org/docs/stable/core_extensions/httpfs/s3api
 func (s *Server) createS3Secret(db *sql.DB) error {
 	// Check if secret already exists to avoid unnecessary creation
