@@ -13,6 +13,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/posthog/duckgres/transpiler"
 )
@@ -225,9 +226,19 @@ func (c *clientConn) sendInitialParams() {
 
 func (c *clientConn) messageLoop() error {
 	for {
+		// Set read deadline if idle timeout is configured
+		if c.server.cfg.IdleTimeout > 0 {
+			c.conn.SetReadDeadline(time.Now().Add(c.server.cfg.IdleTimeout))
+		}
+
 		msgType, body, err := readMessage(c.reader)
 		if err != nil {
 			if err == io.EOF {
+				return nil
+			}
+			// Check if this is a timeout error
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				log.Printf("[%s] Connection idle timeout, closing", c.username)
 				return nil
 			}
 			return err

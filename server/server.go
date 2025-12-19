@@ -43,6 +43,11 @@ type Config struct {
 
 	// Graceful shutdown timeout (default: 30s)
 	ShutdownTimeout time.Duration
+
+	// IdleTimeout is the maximum time a connection can be idle before being closed.
+	// This prevents accumulation of zombie connections from clients that disconnect
+	// uncleanly. Default: 10 minutes. Set to 0 to disable.
+	IdleTimeout time.Duration
 }
 
 // DuckLakeConfig configures DuckLake catalog attachment
@@ -111,6 +116,11 @@ func New(cfg Config) (*Server, error) {
 		cfg.ShutdownTimeout = 30 * time.Second
 	}
 
+	// Use default idle timeout if not specified (10 minutes)
+	if cfg.IdleTimeout == 0 {
+		cfg.IdleTimeout = 10 * time.Minute
+	}
+
 	s := &Server{
 		cfg:         cfg,
 		rateLimiter: NewRateLimiter(cfg.RateLimit),
@@ -144,6 +154,12 @@ func (s *Server) ListenAndServe() error {
 			}
 			log.Printf("Accept error: %v", err)
 			continue
+		}
+
+		// Enable TCP keepalive to detect dead connections
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			tcpConn.SetKeepAlive(true)
+			tcpConn.SetKeepAlivePeriod(30 * time.Second)
 		}
 
 		s.wg.Add(1)
@@ -239,6 +255,12 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to open duckdb: %w", err)
 	}
+
+	// Limit the connection pool to a single connection per client session.
+	// This prevents resource exhaustion from too many DuckDB connections.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(30 * time.Minute)
 
 	// Verify connection
 	if err := db.Ping(); err != nil {
