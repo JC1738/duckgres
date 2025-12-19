@@ -91,8 +91,9 @@ type Server struct {
 	closeMu     sync.Mutex
 	activeConns int64 // atomic counter for active connections
 
-	// duckLakeMu serializes DuckLake secret creation to avoid write-write conflicts
-	duckLakeMu sync.Mutex
+	// duckLakeSem serializes DuckLake attachment to avoid write-write conflicts.
+	// Using a channel instead of mutex allows for timeout on acquisition.
+	duckLakeSem chan struct{}
 }
 
 func New(cfg Config) (*Server, error) {
@@ -127,6 +128,7 @@ func New(cfg Config) (*Server, error) {
 		tlsConfig: &tls.Config{
 			Certificates: []tls.Certificate{cert},
 		},
+		duckLakeSem: make(chan struct{}, 1),
 	}
 
 	log.Printf("TLS enabled with certificate: %s", cfg.TLSCertFile)
@@ -330,27 +332,21 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 		return nil // DuckLake not configured
 	}
 
-	// Fast path: check if DuckLake is already attached (no mutex needed)
-	// This avoids blocking on the mutex for the common case where DuckLake
-	// was already attached by an earlier connection.
-	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'ducklake'").Scan(&count)
-	if err == nil && count > 0 {
-		// Already attached, just set as default
-		if _, err := db.Exec("USE ducklake"); err != nil {
-			return fmt.Errorf("failed to set DuckLake as default catalog: %w", err)
-		}
-		return nil
+	// Serialize DuckLake attachment to avoid race conditions where multiple
+	// connections try to attach simultaneously, causing errors like
+	// "database with name '__ducklake_metadata_ducklake' already exists".
+	// Use a 30-second timeout to prevent connections from hanging indefinitely
+	// if attachment is slow (e.g., network latency to metadata store).
+	select {
+	case s.duckLakeSem <- struct{}{}:
+		defer func() { <-s.duckLakeSem }()
+	case <-time.After(30 * time.Second):
+		return fmt.Errorf("timeout waiting for DuckLake attachment lock")
 	}
 
-	// Slow path: need to attach DuckLake. Serialize to avoid race conditions
-	// where multiple connections try to attach simultaneously, causing
-	// "database with name '__ducklake_metadata_ducklake' already exists" errors
-	s.duckLakeMu.Lock()
-	defer s.duckLakeMu.Unlock()
-
-	// Double-check after acquiring mutex (another goroutine may have attached)
-	err = db.QueryRow("SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'ducklake'").Scan(&count)
+	// Check if DuckLake catalog is already attached
+	var count int
+	err := db.QueryRow("SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'ducklake'").Scan(&count)
 	if err == nil && count > 0 {
 		// Already attached, just set as default
 		if _, err := db.Exec("USE ducklake"); err != nil {
@@ -410,7 +406,7 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 //   - "config": explicit credentials (for MinIO or when you have access keys)
 //   - "credential_chain": AWS SDK credential chain (env vars, config files, instance metadata, etc.)
 //
-// Note: Caller must hold duckLakeMu to avoid race conditions.
+// Note: Caller must hold duckLakeSem to avoid race conditions.
 // See: https://duckdb.org/docs/stable/core_extensions/httpfs/s3api
 func (s *Server) createS3Secret(db *sql.DB) error {
 	// Check if secret already exists to avoid unnecessary creation
