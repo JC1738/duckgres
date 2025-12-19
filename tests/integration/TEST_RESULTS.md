@@ -11,7 +11,7 @@ The integration test suite validates Duckgres compatibility with PostgreSQL for 
 
 | Mode | Description | Pass Rate |
 |------|-------------|-----------|
-| **DuckLake** (default) | Full DuckLake with PostgreSQL metadata + MinIO | 53% |
+| **DuckLake** (default) | Full DuckLake with PostgreSQL metadata + MinIO | 80% |
 | **Vanilla DuckDB** | In-memory DuckDB without DuckLake | 76% |
 
 To run without DuckLake: `DUCKGRES_TEST_NO_DUCKLAKE=1 go test ./tests/integration/...`
@@ -20,9 +20,9 @@ To run without DuckLake: `DUCKGRES_TEST_NO_DUCKLAKE=1 go test ./tests/integratio
 
 | Metric | Count |
 |--------|-------|
-| **PASS** | 48 |
-| **FAIL** | 42 |
-| **Pass Rate** | 53% |
+| **PASS** | 579 |
+| **FAIL** | 142 |
+| **Pass Rate** | 80% |
 
 ### Overall Results (Vanilla DuckDB Mode)
 
@@ -84,11 +84,22 @@ DuckLake has additional constraints compared to vanilla DuckDB:
 |----------|-----------|
 | pg_catalog Compatibility | 100% |
 | information_schema | 100% |
+| psql Commands | 100% |
+| System Functions | 100% |
+| SET/SHOW Commands | 100% |
+| Session Management | 100% |
 | DDL (with constraint stripping) | ~70% |
 | DML (without RETURNING) | ~60% |
 | Window Functions | 100% |
 | CTEs | 100% |
 | Set Operations | 100% |
+| Grafana Queries | 100% |
+| Superset Queries | 100% |
+| Tableau Queries | 100% |
+| Fivetran Queries | 100% |
+| Airbyte Queries | 100% |
+| dbt Queries | 100% |
+| DBeaver Queries | 100% |
 
 ## Passing Test Categories (Vanilla DuckDB)
 

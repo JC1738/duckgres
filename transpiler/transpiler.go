@@ -25,7 +25,7 @@ func New(cfg Config) *Transpiler {
 	// Order matters: more specific transforms should come first
 
 	// 1. pg_catalog schema and view mappings
-	t.transforms = append(t.transforms, transform.NewPgCatalogTransform())
+	t.transforms = append(t.transforms, transform.NewPgCatalogTransformWithConfig(cfg.DuckLakeMode))
 
 	// 2. Type mappings (JSONB->JSON, CHAR->TEXT, etc.)
 	t.transforms = append(t.transforms, transform.NewTypeMappingTransform())
