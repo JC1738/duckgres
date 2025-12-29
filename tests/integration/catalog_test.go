@@ -390,6 +390,11 @@ func TestCatalogStubs(t *testing.T) {
 			Query:        "SELECT * FROM pg_catalog.pg_matviews LIMIT 5",
 			DuckgresOnly: true,
 		},
+		{
+			Name:         "pg_matviews_unqualified",
+			Query:        "SELECT * FROM pg_matviews LIMIT 5",
+			DuckgresOnly: true,
+		},
 	}
 	runQueryTests(t, tests)
 }

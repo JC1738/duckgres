@@ -110,21 +110,34 @@ func (t *PgCatalogTransform) walkAndTransform(node *pg_query.Node, changed *bool
 	case *pg_query.Node_RangeVar:
 		// Table references: pg_catalog.pg_class -> pg_class_full
 		// In DuckLake mode, we need to fully qualify with memory.main
-		if n.RangeVar != nil && strings.EqualFold(n.RangeVar.Schemaname, "pg_catalog") {
+		if n.RangeVar != nil {
 			relname := strings.ToLower(n.RangeVar.Relname)
-			if newName, ok := t.ViewMappings[relname]; ok {
-				n.RangeVar.Relname = newName
-				if t.DuckLakeMode {
-					// In DuckLake mode, our views are in memory.main
-					n.RangeVar.Catalogname = "memory"
-					n.RangeVar.Schemaname = "main"
+
+			if strings.EqualFold(n.RangeVar.Schemaname, "pg_catalog") {
+				// Handle pg_catalog prefixed references
+				if newName, ok := t.ViewMappings[relname]; ok {
+					n.RangeVar.Relname = newName
+					if t.DuckLakeMode {
+						// In DuckLake mode, our views are in memory.main
+						n.RangeVar.Catalogname = "memory"
+						n.RangeVar.Schemaname = "main"
+					} else {
+						n.RangeVar.Schemaname = ""
+					}
 				} else {
 					n.RangeVar.Schemaname = ""
 				}
-			} else {
-				n.RangeVar.Schemaname = ""
+				*changed = true
+			} else if t.DuckLakeMode && n.RangeVar.Schemaname == "" && n.RangeVar.Catalogname == "" {
+				// Handle unqualified pg_catalog view names in DuckLake mode
+				// e.g., "SELECT * FROM pg_matviews" -> "SELECT * FROM memory.main.pg_matviews"
+				if newName, ok := t.ViewMappings[relname]; ok {
+					n.RangeVar.Relname = newName
+					n.RangeVar.Catalogname = "memory"
+					n.RangeVar.Schemaname = "main"
+					*changed = true
+				}
 			}
-			*changed = true
 		}
 
 	case *pg_query.Node_FuncCall:
