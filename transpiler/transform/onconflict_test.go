@@ -112,6 +112,34 @@ func TestOnConflictTransform_DuckLakeMode_DoUpdate(t *testing.T) {
 				"AND",
 			},
 		},
+		{
+			name:  "INSERT SELECT FROM staging table (Fivetran pattern)",
+			input: `INSERT INTO users (id, name, email) SELECT id, name, email FROM staging_table ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, email = EXCLUDED.email`,
+			wantContains: []string{
+				"MERGE INTO users",
+				"USING (SELECT id, name, email FROM staging_table)",
+				"excluded",
+				"ON excluded.id = users.id",
+				"WHEN MATCHED THEN UPDATE SET name = excluded.name, email = excluded.email",
+				"WHEN NOT MATCHED THEN INSERT",
+			},
+			wantNotContains: []string{
+				"ON CONFLICT",
+			},
+		},
+		{
+			name:  "INSERT SELECT with schema-qualified staging table",
+			input: `INSERT INTO "myschema"."users" (id, name) SELECT "id", "name" FROM "myschema_staging"."temp_users" ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name`,
+			wantContains: []string{
+				"MERGE INTO myschema.users",
+				"FROM myschema_staging.temp_users",
+				"WHEN MATCHED THEN UPDATE",
+				"WHEN NOT MATCHED THEN INSERT",
+			},
+			wantNotContains: []string{
+				"ON CONFLICT",
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -665,5 +693,105 @@ func TestOnConflictTransform_DataTypes(t *testing.T) {
 				t.Errorf("SQL should contain %q\nGot: %s", tt.check, sql)
 			}
 		})
+	}
+}
+
+func TestOnConflictTransform_FivetranPattern(t *testing.T) {
+	// Test the exact pattern Fivetran uses: INSERT INTO target SELECT FROM staging ON CONFLICT DO UPDATE
+	tr := NewOnConflictTransformWithConfig(true)
+
+	// Simplified version of the Fivetran query
+	input := `INSERT INTO "stripe_test"."invoice" ("id", "status", "amount_due", "currency", "_fivetran_synced")
+		SELECT "id", "status", "amount_due", "currency", "_fivetran_synced"
+		FROM "stripe_test_staging"."temp_invoice"
+		ON CONFLICT ("id") DO UPDATE SET
+			"status" = "excluded"."status",
+			"amount_due" = "excluded"."amount_due",
+			"currency" = "excluded"."currency",
+			"_fivetran_synced" = "excluded"."_fivetran_synced"`
+
+	tree, err := pg_query.Parse(input)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	result := &Result{}
+	changed, err := tr.Transform(tree, result)
+	if err != nil {
+		t.Fatalf("Transform error: %v", err)
+	}
+
+	if !changed {
+		t.Error("Transform should change SQL in DuckLake mode")
+	}
+
+	// Should be converted to MERGE
+	if tree.Stmts[0].Stmt.GetMergeStmt() == nil {
+		t.Fatal("Statement should be converted to MERGE")
+	}
+
+	sql, err := pg_query.Deparse(tree)
+	if err != nil {
+		t.Fatalf("Deparse error: %v", err)
+	}
+
+	// Verify key parts of the MERGE statement
+	checks := []string{
+		"MERGE INTO stripe_test.invoice",
+		"USING (SELECT",
+		"FROM stripe_test_staging.temp_invoice",
+		"excluded",
+		"WHEN MATCHED THEN UPDATE SET",
+		"WHEN NOT MATCHED THEN INSERT",
+	}
+
+	for _, check := range checks {
+		if !strings.Contains(sql, check) {
+			t.Errorf("SQL should contain %q\nGot: %s", check, sql)
+		}
+	}
+
+	// Should NOT contain ON CONFLICT
+	if strings.Contains(sql, "ON CONFLICT") {
+		t.Errorf("SQL should NOT contain ON CONFLICT\nGot: %s", sql)
+	}
+
+	t.Logf("Transformed SQL:\n%s", sql)
+}
+
+func TestOnConflictTransform_InsertSelectDoNothing(t *testing.T) {
+	tr := NewOnConflictTransformWithConfig(true)
+
+	input := `INSERT INTO target (id, data) SELECT id, data FROM source ON CONFLICT (id) DO NOTHING`
+
+	tree, err := pg_query.Parse(input)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	result := &Result{}
+	changed, err := tr.Transform(tree, result)
+	if err != nil {
+		t.Fatalf("Transform error: %v", err)
+	}
+
+	if !changed {
+		t.Error("Transform should change SQL in DuckLake mode")
+	}
+
+	sql, err := pg_query.Deparse(tree)
+	if err != nil {
+		t.Fatalf("Deparse error: %v", err)
+	}
+
+	// Should have MERGE with only WHEN NOT MATCHED (no UPDATE for DO NOTHING)
+	if !strings.Contains(sql, "MERGE INTO target") {
+		t.Errorf("Should have MERGE INTO target: %s", sql)
+	}
+	if !strings.Contains(sql, "WHEN NOT MATCHED THEN INSERT") {
+		t.Errorf("Should have WHEN NOT MATCHED: %s", sql)
+	}
+	if strings.Contains(sql, "WHEN MATCHED") {
+		t.Errorf("Should NOT have WHEN MATCHED for DO NOTHING: %s", sql)
 	}
 }

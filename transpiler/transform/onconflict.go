@@ -83,15 +83,23 @@ func (t *OnConflictTransform) transformInsertToMerge(insert *pg_query.InsertStmt
 		}
 	}
 
-	// Get VALUES from INSERT's SelectStmt
+	// Get the SelectStmt from INSERT
 	selectStmt := insert.SelectStmt.GetSelectStmt()
-	if selectStmt == nil || len(selectStmt.ValuesLists) == 0 {
+	if selectStmt == nil {
 		return nil
 	}
 
-	// Build the source subquery: SELECT val1 AS col1, val2 AS col2, ...
-	// We use a VALUES clause in a subquery for multiple rows, or SELECT for single row
-	sourceSelect := t.buildSourceSelect(colNames, selectStmt.ValuesLists)
+	// Build source SELECT - handle both VALUES and SELECT ... FROM cases
+	var sourceSelect *pg_query.SelectStmt
+	if len(selectStmt.ValuesLists) > 0 {
+		// INSERT ... VALUES (...) ON CONFLICT - build SELECT from values
+		sourceSelect = t.buildSourceSelect(colNames, selectStmt.ValuesLists)
+	} else if len(selectStmt.FromClause) > 0 || len(selectStmt.TargetList) > 0 {
+		// INSERT ... SELECT ... FROM ... ON CONFLICT - use SELECT directly
+		// The SELECT already has the right columns, just use it as the source
+		sourceSelect = selectStmt
+	}
+
 	if sourceSelect == nil {
 		return nil
 	}
