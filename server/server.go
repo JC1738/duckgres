@@ -43,6 +43,11 @@ type Config struct {
 
 	// Graceful shutdown timeout (default: 30s)
 	ShutdownTimeout time.Duration
+
+	// IdleTimeout is the maximum time a connection can be idle before being closed.
+	// This prevents accumulation of zombie connections from clients that disconnect
+	// uncleanly. Default: 10 minutes. Set to 0 to disable.
+	IdleTimeout time.Duration
 }
 
 // DuckLakeConfig configures DuckLake catalog attachment
@@ -85,6 +90,10 @@ type Server struct {
 	closed      bool
 	closeMu     sync.Mutex
 	activeConns int64 // atomic counter for active connections
+
+	// duckLakeSem serializes DuckLake attachment to avoid write-write conflicts.
+	// Using a channel instead of mutex allows for timeout on acquisition.
+	duckLakeSem chan struct{}
 }
 
 func New(cfg Config) (*Server, error) {
@@ -108,12 +117,18 @@ func New(cfg Config) (*Server, error) {
 		cfg.ShutdownTimeout = 30 * time.Second
 	}
 
+	// Use default idle timeout if not specified (10 minutes)
+	if cfg.IdleTimeout == 0 {
+		cfg.IdleTimeout = 10 * time.Minute
+	}
+
 	s := &Server{
 		cfg:         cfg,
 		rateLimiter: NewRateLimiter(cfg.RateLimit),
 		tlsConfig: &tls.Config{
 			Certificates: []tls.Certificate{cert},
 		},
+		duckLakeSem: make(chan struct{}, 1),
 	}
 
 	log.Printf("TLS enabled with certificate: %s", cfg.TLSCertFile)
@@ -141,6 +156,12 @@ func (s *Server) ListenAndServe() error {
 			}
 			log.Printf("Accept error: %v", err)
 			continue
+		}
+
+		// Enable TCP keepalive to detect dead connections
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			tcpConn.SetKeepAlive(true)
+			tcpConn.SetKeepAlivePeriod(30 * time.Second)
 		}
 
 		s.wg.Add(1)
@@ -227,15 +248,18 @@ func (s *Server) ActiveConnections() int64 {
 	return atomic.LoadInt64(&s.activeConns)
 }
 
-// createDBConnection creates a new DuckDB connection for a client session.
-// Each client connection gets its own DB connection to ensure proper isolation
-// of temporary tables and session state, matching PostgreSQL's behavior.
+// createDBConnection creates a DuckDB connection for a client session.
+// Uses in-memory database as an anchor for DuckLake attachment (actual data lives in RDS/S3).
 func (s *Server) createDBConnection(username string) (*sql.DB, error) {
-	dbPath := fmt.Sprintf("%s/%s.db", s.cfg.DataDir, username)
-	db, err := sql.Open("duckdb", dbPath)
+	// Create new in-memory connection (DuckLake provides actual storage)
+	db, err := sql.Open("duckdb", ":memory:")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open duckdb: %w", err)
 	}
+
+	// Single connection per client session
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 
 	// Verify connection
 	if err := db.Ping(); err != nil {
@@ -246,22 +270,54 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 	// Load configured extensions
 	if err := s.loadExtensions(db); err != nil {
 		log.Printf("Warning: failed to load some extensions for user %q: %v", username, err)
-		// Continue anyway - database will still work without the extensions
-	}
-
-	// Attach DuckLake catalog if configured
-	if err := s.attachDuckLake(db); err != nil {
-		log.Printf("Warning: failed to attach DuckLake for user %q: %v", username, err)
-		// Continue anyway - database will still work without DuckLake
 	}
 
 	// Initialize pg_catalog schema for PostgreSQL compatibility
+	// Must be done BEFORE attaching DuckLake so macros are created in memory.main,
+	// not in the DuckLake catalog (which doesn't support macro storage).
 	if err := initPgCatalog(db); err != nil {
 		log.Printf("Warning: failed to initialize pg_catalog for user %q: %v", username, err)
 		// Continue anyway - basic queries will still work
 	}
 
-	log.Printf("Opened DuckDB connection for user %q at %s", username, dbPath)
+	// Attach DuckLake catalog if configured (but don't set as default yet)
+	duckLakeMode := false
+	if err := s.attachDuckLake(db); err != nil {
+		// If DuckLake was explicitly configured, fail the connection.
+		// Silent fallback to local DB causes schema/table mismatches.
+		if s.cfg.DuckLake.MetadataStore != "" {
+			db.Close()
+			return nil, fmt.Errorf("DuckLake configured but attachment failed: %w", err)
+		}
+		// DuckLake not configured, this warning is just informational
+		log.Printf("Warning: failed to attach DuckLake for user %q: %v", username, err)
+	} else if s.cfg.DuckLake.MetadataStore != "" {
+		duckLakeMode = true
+
+		// Recreate pg_class_full to source from DuckLake metadata instead of DuckDB's pg_catalog.
+		// This ensures consistent PostgreSQL-compatible OIDs across all pg_class queries.
+		if err := recreatePgClassForDuckLake(db); err != nil {
+			log.Printf("Warning: failed to recreate pg_class_full for DuckLake: %v", err)
+			// Non-fatal: continue with DuckDB-based pg_class_full
+		}
+	}
+
+	// Initialize information_schema compatibility views in memory.main
+	// Must be done AFTER attaching DuckLake (so views can reference ducklake.information_schema)
+	// but BEFORE setting DuckLake as default (so views are created in memory.main, not ducklake.main)
+	if err := initInformationSchema(db, duckLakeMode); err != nil {
+		log.Printf("Warning: failed to initialize information_schema for user %q: %v", username, err)
+		// Continue anyway - basic queries will still work
+	}
+
+	// Now set DuckLake as the default catalog so all user queries use it
+	if duckLakeMode {
+		if err := setDuckLakeDefault(db); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to set DuckLake as default: %w", err)
+		}
+	}
+
 	return db, nil
 }
 
@@ -293,10 +349,31 @@ func (s *Server) loadExtensions(db *sql.DB) error {
 	return lastErr
 }
 
-// attachDuckLake attaches a DuckLake catalog if configured
+// attachDuckLake attaches a DuckLake catalog if configured (but does NOT set it as default).
+// Call setDuckLakeDefault after creating per-connection views in memory.main.
 func (s *Server) attachDuckLake(db *sql.DB) error {
 	if s.cfg.DuckLake.MetadataStore == "" {
 		return nil // DuckLake not configured
+	}
+
+	// Serialize DuckLake attachment to avoid race conditions where multiple
+	// connections try to attach simultaneously, causing errors like
+	// "database with name '__ducklake_metadata_ducklake' already exists".
+	// Use a 30-second timeout to prevent connections from hanging indefinitely
+	// if attachment is slow (e.g., network latency to metadata store).
+	select {
+	case s.duckLakeSem <- struct{}{}:
+		defer func() { <-s.duckLakeSem }()
+	case <-time.After(30 * time.Second):
+		return fmt.Errorf("timeout waiting for DuckLake attachment lock")
+	}
+
+	// Check if DuckLake catalog is already attached
+	var count int
+	err := db.QueryRow("SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'ducklake'").Scan(&count)
+	if err == nil && count > 0 {
+		// Already attached
+		return nil
 	}
 
 	// Create S3 secret if using object store
@@ -335,13 +412,27 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 		return fmt.Errorf("failed to attach DuckLake: %w", err)
 	}
 
-	// Set DuckLake as the default catalog so all queries use it
-	// See: https://duckdb.org/docs/stable/core_extensions/ducklake#usage
+	log.Printf("Attached DuckLake catalog successfully")
+
+	// Set DuckLake max retry count to handle concurrent connections
+	// DuckLake uses optimistic concurrency - when multiple connections commit
+	// simultaneously, they may conflict on snapshot IDs. Default of 10 is too low
+	// for tools like Fivetran that open many concurrent connections.
+	if _, err := db.Exec("SET ducklake_max_retry_count = 100"); err != nil {
+		log.Printf("Warning: failed to set ducklake_max_retry_count: %v", err)
+		// Don't fail - this is not critical, DuckLake will use its default
+	}
+
+	return nil
+}
+
+// setDuckLakeDefault sets the DuckLake catalog as the default so all queries use it.
+// This should be called AFTER creating per-connection views in memory.main.
+func setDuckLakeDefault(db *sql.DB) error {
 	if _, err := db.Exec("USE ducklake"); err != nil {
 		return fmt.Errorf("failed to set DuckLake as default catalog: %w", err)
 	}
-
-	log.Printf("Attached DuckLake catalog successfully and set as default")
+	log.Printf("Set DuckLake as default catalog")
 	return nil
 }
 
@@ -350,8 +441,16 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 //   - "config": explicit credentials (for MinIO or when you have access keys)
 //   - "credential_chain": AWS SDK credential chain (env vars, config files, instance metadata, etc.)
 //
+// Note: Caller must hold duckLakeSem to avoid race conditions.
 // See: https://duckdb.org/docs/stable/core_extensions/httpfs/s3api
 func (s *Server) createS3Secret(db *sql.DB) error {
+	// Check if secret already exists to avoid unnecessary creation
+	var count int
+	err := db.QueryRow("SELECT COUNT(*) FROM duckdb_secrets() WHERE name = 'ducklake_s3'").Scan(&count)
+	if err == nil && count > 0 {
+		return nil // Secret already exists
+	}
+
 	// Determine provider: use credential_chain if explicitly set or if no access key provided
 	provider := s.cfg.DuckLake.S3Provider
 	if provider == "" {

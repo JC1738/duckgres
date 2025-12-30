@@ -223,6 +223,32 @@ func writeErrorResponse(w io.Writer, severity, code, message string) error {
 	return writeMessage(w, msgErrorResponse, data)
 }
 
+// writeNoticeResponse sends a notice/warning to the client
+// Unlike errors, notices are informational and don't terminate the command
+func writeNoticeResponse(w io.Writer, severity, code, message string) error {
+	var data []byte
+
+	// Severity (WARNING, NOTICE, INFO, DEBUG, LOG)
+	data = append(data, 'S')
+	data = append(data, []byte(severity)...)
+	data = append(data, 0)
+
+	// SQLSTATE code
+	data = append(data, 'C')
+	data = append(data, []byte(code)...)
+	data = append(data, 0)
+
+	// Message
+	data = append(data, 'M')
+	data = append(data, []byte(message)...)
+	data = append(data, 0)
+
+	// Terminator
+	data = append(data, 0)
+
+	return writeMessage(w, msgNoticeResponse, data)
+}
+
 // writeCommandComplete sends a command completion message
 func writeCommandComplete(w io.Writer, tag string) error {
 	data := []byte(tag)

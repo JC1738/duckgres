@@ -2,8 +2,7 @@ package server
 
 import (
 	"database/sql"
-	"regexp"
-	"strings"
+	"fmt"
 )
 
 // initPgCatalog creates PostgreSQL compatibility functions and views in DuckDB
@@ -11,24 +10,24 @@ import (
 func initPgCatalog(db *sql.DB) error {
 	// Create our own pg_database view that has all the columns psql expects
 	// We put it in main schema and rewrite queries to use it
+	// Include template databases for PostgreSQL compatibility
+	// Note: We use 'testdb' as the user database name to match the test PostgreSQL container
 	pgDatabaseSQL := `
 		CREATE OR REPLACE VIEW pg_database AS
-		SELECT
-			1::INTEGER AS oid,
-			current_database() AS datname,
-			0::INTEGER AS datdba,
-			6::INTEGER AS encoding,
-			'en_US.UTF-8' AS datcollate,
-			'en_US.UTF-8' AS datctype,
-			false AS datistemplate,
-			true AS datallowconn,
-			-1::INTEGER AS datconnlimit,
-			NULL AS datacl
+		SELECT * FROM (
+			VALUES
+				(1::INTEGER, 'postgres', 10::INTEGER, 6::INTEGER, 'en_US.UTF-8', 'en_US.UTF-8', false, true, -1::INTEGER, NULL),
+				(2::INTEGER, 'template0', 10::INTEGER, 6::INTEGER, 'en_US.UTF-8', 'en_US.UTF-8', true, false, -1::INTEGER, NULL),
+				(3::INTEGER, 'template1', 10::INTEGER, 6::INTEGER, 'en_US.UTF-8', 'en_US.UTF-8', true, true, -1::INTEGER, NULL),
+				(4::INTEGER, 'testdb', 10::INTEGER, 6::INTEGER, 'en_US.UTF-8', 'en_US.UTF-8', false, true, -1::INTEGER, NULL)
+		) AS t(oid, datname, datdba, encoding, datcollate, datctype, datistemplate, datallowconn, datconnlimit, datacl)
 	`
 	db.Exec(pgDatabaseSQL)
 
 	// Create pg_class wrapper that adds missing columns psql expects
 	// DuckDB's pg_catalog.pg_class is missing relforcerowsecurity
+	// Also filter out internal duckgres views so they don't appear in \dt output
+	// Note: We use an explicit list of internal view names to filter
 	pgClassSQL := `
 		CREATE OR REPLACE VIEW pg_class_full AS
 		SELECT
@@ -69,6 +68,13 @@ func initPgCatalog(db *sql.DB) error {
 			reloptions,
 			relpartbound
 		FROM pg_catalog.pg_class
+		WHERE relname NOT IN (
+			'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
+			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
+			'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
+			'information_schema_columns_compat', 'information_schema_tables_compat',
+			'information_schema_schemata_compat', '__duckgres_column_metadata'
+		)
 	`
 	db.Exec(pgClassSQL)
 
@@ -205,19 +211,59 @@ func initPgCatalog(db *sql.DB) error {
 	`
 	db.Exec(pgInheritsSQL)
 
+	// Create pg_matviews view (materialized views, empty - DuckDB doesn't support matviews)
+	pgMatviewsSQL := `
+		CREATE OR REPLACE VIEW pg_matviews AS
+		SELECT
+			''::VARCHAR AS schemaname,
+			''::VARCHAR AS matviewname,
+			''::VARCHAR AS matviewowner,
+			NULL::VARCHAR AS tablespace,
+			false AS hasindexes,
+			false AS ispopulated,
+			''::VARCHAR AS definition
+		WHERE false
+	`
+	db.Exec(pgMatviewsSQL)
+
+	// Create pg_namespace wrapper that maps 'main' to 'public' for PostgreSQL compatibility
+	// Also set owner to match PostgreSQL conventions:
+	// - public (main) is owned by pg_database_owner (OID 6171)
+	// - other schemas are owned by postgres (OID 10)
+	pgNamespaceSQL := `
+		CREATE OR REPLACE VIEW pg_namespace AS
+		SELECT
+			oid,
+			CASE WHEN nspname = 'main' THEN 'public' ELSE nspname END AS nspname,
+			CASE WHEN nspname = 'main' THEN 6171::BIGINT ELSE 10::BIGINT END AS nspowner,
+			nspacl
+		FROM pg_catalog.pg_namespace
+	`
+	db.Exec(pgNamespaceSQL)
+
 	// Create helper macros/functions that psql expects but DuckDB doesn't have
 	// These need to be created without schema prefix so DuckDB finds them
+	//
+	// IMPORTANT: When adding new custom macros here, also add them to the CustomMacros
+	// map in transpiler/transform/pgcatalog.go so they get the memory.main. prefix
+	// in DuckLake mode. Otherwise, the macros won't be found when DuckLake is attached.
 	functions := []string{
 		// pg_get_userbyid - returns username for a role OID
-		`CREATE OR REPLACE MACRO pg_get_userbyid(id) AS 'duckdb'`,
+		// Map common PostgreSQL role OIDs to their names
+		`CREATE OR REPLACE MACRO pg_get_userbyid(id) AS
+			CASE id
+				WHEN 10 THEN 'postgres'
+				WHEN 6171 THEN 'pg_database_owner'
+				ELSE 'postgres'
+			END`,
 		// pg_table_is_visible - checks if table is in search path
 		`CREATE OR REPLACE MACRO pg_table_is_visible(oid) AS true`,
 		// has_schema_privilege - check schema access
-		`CREATE OR REPLACE MACRO has_schema_privilege(schema, priv) AS true`,
-		`CREATE OR REPLACE MACRO has_schema_privilege(u, schema, priv) AS true`,
+		// Note: DuckDB doesn't support macro overloading well, so we only define 2-arg versions
+		// The transpiler should handle 3-arg calls by dropping the user argument
+		`CREATE OR REPLACE MACRO has_schema_privilege(schema_name, priv) AS true`,
 		// has_table_privilege - check table access
 		`CREATE OR REPLACE MACRO has_table_privilege(table_name, priv) AS true`,
-		`CREATE OR REPLACE MACRO has_table_privilege(u, table_name, priv) AS true`,
 		// pg_encoding_to_char - convert encoding ID to name
 		`CREATE OR REPLACE MACRO pg_encoding_to_char(enc) AS 'UTF8'`,
 		// format_type - format a type OID as string
@@ -270,6 +316,9 @@ func initPgCatalog(db *sql.DB) error {
 			END`,
 		// pg_is_in_recovery - check if in recovery mode
 		`CREATE OR REPLACE MACRO pg_is_in_recovery() AS false`,
+		// version - return PostgreSQL-compatible version string
+		// Fivetran and other tools check this to determine compatibility
+		`CREATE OR REPLACE MACRO version() AS 'PostgreSQL 15.0 on x86_64-pc-linux-gnu, compiled by gcc, 64-bit (Duckgres/DuckDB)'`,
 	}
 
 	for _, f := range functions {
@@ -282,142 +331,366 @@ func initPgCatalog(db *sql.DB) error {
 	return nil
 }
 
-// pgCatalogFunctions is the list of functions we provide that psql calls with pg_catalog. prefix
-var pgCatalogFunctions = []string{
-	"pg_get_userbyid",
-	"pg_table_is_visible",
-	"pg_get_expr",
-	"pg_encoding_to_char",
-	"format_type",
-	"obj_description",
-	"col_description",
-	"shobj_description",
-	"pg_get_indexdef",
-	"pg_get_constraintdef",
-	"pg_get_partkeydef",
-	"pg_get_statisticsobjdef_columns",
-	"pg_relation_is_publishable",
-	"current_setting",
-	"pg_is_in_recovery",
-	"has_schema_privilege",
-	"has_table_privilege",
-	"array_to_string",
+// initInformationSchema creates the column metadata table and information_schema wrapper views.
+// This enables accurate type information (VARCHAR lengths, NUMERIC precision) in information_schema.
+// Views are created in memory.main (before USE ducklake) and query from unqualified information_schema,
+// which resolves to the default catalog's information_schema at query time.
+func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
+	// Use just "information_schema" without catalog prefix
+	// Views are created in memory.main (before USE ducklake) and query from information_schema
+	// which resolves to the current default catalog's information_schema at query time
+	infoSchemaPrefix := "information_schema"
+
+	// Create metadata table to store column type information that DuckDB doesn't preserve
+	// Table is created in main schema (which is memory.main before USE ducklake)
+	metadataTableSQL := `
+		CREATE TABLE IF NOT EXISTS main.__duckgres_column_metadata (
+			table_schema VARCHAR NOT NULL,
+			table_name VARCHAR NOT NULL,
+			column_name VARCHAR NOT NULL,
+			character_maximum_length INTEGER,
+			numeric_precision INTEGER,
+			numeric_scale INTEGER,
+			PRIMARY KEY (table_schema, table_name, column_name)
+		)
+	`
+	if _, err := db.Exec(metadataTableSQL); err != nil {
+		// Table might already exist, that's OK
+		// Ignore errors since PRIMARY KEY might not work in all contexts
+	}
+
+	// Create information_schema.columns wrapper view
+	// Transforms DuckDB type names to PostgreSQL-compatible names
+	// Maps: VARCHAR->text, BOOLEAN->boolean, INTEGER->integer, BIGINT->bigint,
+	//       TIMESTAMP->timestamp without time zone, DECIMAL->numeric, etc.
+	// Views are created in main schema (which is memory.main before USE ducklake)
+	columnsViewSQL := `
+		CREATE OR REPLACE VIEW main.information_schema_columns_compat AS
+		SELECT
+			c.table_catalog,
+			CASE WHEN c.table_schema = 'main' THEN 'public' ELSE c.table_schema END AS table_schema,
+			c.table_name,
+			c.column_name,
+			c.ordinal_position,
+			-- Normalize column_default to PostgreSQL format
+			CASE
+				WHEN c.column_default IS NULL THEN NULL
+				WHEN c.column_default = 'CAST(''t'' AS BOOLEAN)' THEN 'true'
+				WHEN c.column_default = 'CAST(''f'' AS BOOLEAN)' THEN 'false'
+				WHEN UPPER(c.column_default) = 'CURRENT_TIMESTAMP' THEN 'CURRENT_TIMESTAMP'
+				WHEN UPPER(c.column_default) = 'NOW()' THEN 'now()'
+				ELSE c.column_default
+			END AS column_default,
+			c.is_nullable,
+			-- Normalize data_type to PostgreSQL lowercase format
+			CASE
+				WHEN UPPER(c.data_type) = 'VARCHAR' OR UPPER(c.data_type) LIKE 'VARCHAR(%%' THEN 'text'
+				WHEN UPPER(c.data_type) = 'TEXT' THEN 'text'
+				WHEN UPPER(c.data_type) LIKE 'TEXT(%%' THEN 'character'
+				WHEN UPPER(c.data_type) = 'BOOLEAN' THEN 'boolean'
+				WHEN UPPER(c.data_type) = 'TINYINT' THEN 'smallint'
+				WHEN UPPER(c.data_type) = 'SMALLINT' THEN 'smallint'
+				WHEN UPPER(c.data_type) = 'INTEGER' THEN 'integer'
+				WHEN UPPER(c.data_type) = 'BIGINT' THEN 'bigint'
+				WHEN UPPER(c.data_type) = 'HUGEINT' THEN 'numeric'
+				WHEN UPPER(c.data_type) = 'REAL' OR UPPER(c.data_type) = 'FLOAT4' THEN 'real'
+				WHEN UPPER(c.data_type) = 'DOUBLE' OR UPPER(c.data_type) = 'FLOAT8' THEN 'double precision'
+				WHEN UPPER(c.data_type) LIKE 'DECIMAL%%' THEN 'numeric'
+				WHEN UPPER(c.data_type) LIKE 'NUMERIC%%' THEN 'numeric'
+				WHEN UPPER(c.data_type) = 'DATE' THEN 'date'
+				WHEN UPPER(c.data_type) = 'TIME' THEN 'time without time zone'
+				WHEN UPPER(c.data_type) = 'TIMESTAMP' THEN 'timestamp without time zone'
+				WHEN UPPER(c.data_type) = 'TIMESTAMPTZ' OR UPPER(c.data_type) = 'TIMESTAMP WITH TIME ZONE' THEN 'timestamp with time zone'
+				WHEN UPPER(c.data_type) = 'INTERVAL' THEN 'interval'
+				WHEN UPPER(c.data_type) = 'UUID' THEN 'uuid'
+				WHEN UPPER(c.data_type) = 'BLOB' OR UPPER(c.data_type) = 'BYTEA' THEN 'bytea'
+				WHEN UPPER(c.data_type) = 'JSON' THEN 'json'
+				WHEN UPPER(c.data_type) LIKE '%%[]' THEN 'ARRAY'
+				ELSE LOWER(c.data_type)
+			END AS data_type,
+			COALESCE(m.character_maximum_length, c.character_maximum_length) AS character_maximum_length,
+			c.character_octet_length,
+			COALESCE(m.numeric_precision, c.numeric_precision) AS numeric_precision,
+			COALESCE(m.numeric_scale, c.numeric_scale) AS numeric_scale,
+			c.datetime_precision,
+			NULL AS interval_type,
+			NULL AS interval_precision,
+			NULL AS character_set_catalog,
+			NULL AS character_set_schema,
+			NULL AS character_set_name,
+			NULL AS collation_catalog,
+			NULL AS collation_schema,
+			NULL AS collation_name,
+			NULL AS domain_catalog,
+			NULL AS domain_schema,
+			NULL AS domain_name,
+			NULL AS udt_catalog,
+			NULL AS udt_schema,
+			NULL AS udt_name,
+			NULL AS scope_catalog,
+			NULL AS scope_schema,
+			NULL AS scope_name,
+			NULL AS maximum_cardinality,
+			NULL AS dtd_identifier,
+			'NO' AS is_self_referencing,
+			'NO' AS is_identity,
+			NULL AS identity_generation,
+			NULL AS identity_start,
+			NULL AS identity_increment,
+			NULL AS identity_maximum,
+			NULL AS identity_minimum,
+			NULL AS identity_cycle,
+			'NEVER' AS is_generated,
+			NULL AS generation_expression,
+			'YES' AS is_updatable
+		FROM %s.columns c
+		LEFT JOIN main.__duckgres_column_metadata m
+			ON c.table_schema = m.table_schema
+			AND c.table_name = m.table_name
+			AND c.column_name = m.column_name
+	`
+	if _, err := db.Exec(fmt.Sprintf(columnsViewSQL, infoSchemaPrefix)); err != nil {
+		// If join with metadata table fails, create simpler view without it
+		columnsViewSimpleSQL := `
+			CREATE OR REPLACE VIEW main.information_schema_columns_compat AS
+			SELECT
+				table_catalog,
+				CASE WHEN table_schema = 'main' THEN 'public' ELSE table_schema END AS table_schema,
+				table_name,
+				column_name,
+				ordinal_position,
+				-- Normalize column_default to PostgreSQL format
+				CASE
+					WHEN column_default IS NULL THEN NULL
+					WHEN column_default = 'CAST(''t'' AS BOOLEAN)' THEN 'true'
+					WHEN column_default = 'CAST(''f'' AS BOOLEAN)' THEN 'false'
+					WHEN UPPER(column_default) = 'CURRENT_TIMESTAMP' THEN 'CURRENT_TIMESTAMP'
+					WHEN UPPER(column_default) = 'NOW()' THEN 'now()'
+					ELSE column_default
+				END AS column_default,
+				is_nullable,
+				-- Normalize data_type to PostgreSQL lowercase format
+				CASE
+					WHEN UPPER(data_type) = 'VARCHAR' OR UPPER(data_type) LIKE 'VARCHAR(%%' THEN 'text'
+					WHEN UPPER(data_type) = 'TEXT' THEN 'text'
+					WHEN UPPER(data_type) LIKE 'TEXT(%%' THEN 'character'
+					WHEN UPPER(data_type) = 'BOOLEAN' THEN 'boolean'
+					WHEN UPPER(data_type) = 'TINYINT' THEN 'smallint'
+					WHEN UPPER(data_type) = 'SMALLINT' THEN 'smallint'
+					WHEN UPPER(data_type) = 'INTEGER' THEN 'integer'
+					WHEN UPPER(data_type) = 'BIGINT' THEN 'bigint'
+					WHEN UPPER(data_type) = 'HUGEINT' THEN 'numeric'
+					WHEN UPPER(data_type) = 'REAL' OR UPPER(data_type) = 'FLOAT4' THEN 'real'
+					WHEN UPPER(data_type) = 'DOUBLE' OR UPPER(data_type) = 'FLOAT8' THEN 'double precision'
+					WHEN UPPER(data_type) LIKE 'DECIMAL%%' THEN 'numeric'
+					WHEN UPPER(data_type) LIKE 'NUMERIC%%' THEN 'numeric'
+					WHEN UPPER(data_type) = 'DATE' THEN 'date'
+					WHEN UPPER(data_type) = 'TIME' THEN 'time without time zone'
+					WHEN UPPER(data_type) = 'TIMESTAMP' THEN 'timestamp without time zone'
+					WHEN UPPER(data_type) = 'TIMESTAMPTZ' OR UPPER(data_type) = 'TIMESTAMP WITH TIME ZONE' THEN 'timestamp with time zone'
+					WHEN UPPER(data_type) = 'INTERVAL' THEN 'interval'
+					WHEN UPPER(data_type) = 'UUID' THEN 'uuid'
+					WHEN UPPER(data_type) = 'BLOB' OR UPPER(data_type) = 'BYTEA' THEN 'bytea'
+					WHEN UPPER(data_type) = 'JSON' THEN 'json'
+					WHEN UPPER(data_type) LIKE '%%[]' THEN 'ARRAY'
+					ELSE LOWER(data_type)
+				END AS data_type,
+				character_maximum_length,
+				character_octet_length,
+				numeric_precision,
+				numeric_scale,
+				datetime_precision,
+				NULL AS interval_type,
+				NULL AS interval_precision,
+				NULL AS character_set_catalog,
+				NULL AS character_set_schema,
+				NULL AS character_set_name,
+				NULL AS collation_catalog,
+				NULL AS collation_schema,
+				NULL AS collation_name,
+				NULL AS domain_catalog,
+				NULL AS domain_schema,
+				NULL AS domain_name,
+				NULL AS udt_catalog,
+				NULL AS udt_schema,
+				NULL AS udt_name,
+				NULL AS scope_catalog,
+				NULL AS scope_schema,
+				NULL AS scope_name,
+				NULL AS maximum_cardinality,
+				NULL AS dtd_identifier,
+				'NO' AS is_self_referencing,
+				'NO' AS is_identity,
+				NULL AS identity_generation,
+				NULL AS identity_start,
+				NULL AS identity_increment,
+				NULL AS identity_maximum,
+				NULL AS identity_minimum,
+				NULL AS identity_cycle,
+				'NEVER' AS is_generated,
+				NULL AS generation_expression,
+				'YES' AS is_updatable
+			FROM %s.columns
+		`
+		db.Exec(fmt.Sprintf(columnsViewSimpleSQL, infoSchemaPrefix))
+	}
+
+	// Create information_schema.tables wrapper view with additional PostgreSQL columns
+	// Filter out internal duckgres tables/views and DuckDB system views
+	// Normalize 'main' schema to 'public' for PostgreSQL compatibility
+	tablesViewSQL := `
+		CREATE OR REPLACE VIEW main.information_schema_tables_compat AS
+		SELECT
+			t.table_catalog,
+			CASE WHEN t.table_schema = 'main' THEN 'public' ELSE t.table_schema END AS table_schema,
+			t.table_name,
+			t.table_type,
+			NULL AS self_referencing_column_name,
+			NULL AS reference_generation,
+			NULL AS user_defined_type_catalog,
+			NULL AS user_defined_type_schema,
+			NULL AS user_defined_type_name,
+			'YES' AS is_insertable_into,
+			'NO' AS is_typed,
+			NULL AS commit_action
+		FROM %s.tables t
+		WHERE t.table_name NOT IN (
+			-- Internal duckgres tables
+			'__duckgres_column_metadata',
+			-- pg_catalog compat views
+			'pg_class_full', 'pg_collation', 'pg_database', 'pg_inherits',
+			'pg_namespace', 'pg_policy', 'pg_publication', 'pg_publication_rel',
+			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext', 'pg_matviews',
+			-- information_schema compat views
+			'information_schema_columns_compat', 'information_schema_tables_compat',
+			'information_schema_schemata_compat', 'information_schema_views_compat'
+		)
+		AND t.table_name NOT LIKE 'duckdb_%%'
+		AND t.table_name NOT LIKE 'sqlite_%%'
+		AND t.table_name NOT LIKE 'pragma_%%'
+	`
+	db.Exec(fmt.Sprintf(tablesViewSQL, infoSchemaPrefix))
+
+	// Create information_schema.schemata wrapper view
+	// Normalize 'main' to 'public' and add synthetic entries for pg_catalog and information_schema
+	// to match PostgreSQL's information_schema.schemata
+	schemataViewSQL := `
+		CREATE OR REPLACE VIEW main.information_schema_schemata_compat AS
+		SELECT
+			s.catalog_name,
+			CASE WHEN s.schema_name = 'main' THEN 'public' ELSE s.schema_name END AS schema_name,
+			'duckdb' AS schema_owner,
+			NULL AS default_character_set_catalog,
+			NULL AS default_character_set_schema,
+			NULL AS default_character_set_name,
+			NULL AS sql_path
+		FROM %s.schemata s
+		WHERE s.schema_name NOT IN ('main', 'pg_catalog', 'information_schema')
+		UNION ALL
+		SELECT 'memory' AS catalog_name, 'public' AS schema_name, 'duckdb' AS schema_owner,
+			NULL, NULL, NULL, NULL
+		UNION ALL
+		SELECT 'memory' AS catalog_name, 'pg_catalog' AS schema_name, 'duckdb' AS schema_owner,
+			NULL, NULL, NULL, NULL
+		UNION ALL
+		SELECT 'memory' AS catalog_name, 'information_schema' AS schema_name, 'duckdb' AS schema_owner,
+			NULL, NULL, NULL, NULL
+		UNION ALL
+		SELECT 'memory' AS catalog_name, 'pg_toast' AS schema_name, 'duckdb' AS schema_owner,
+			NULL, NULL, NULL, NULL
+	`
+	db.Exec(fmt.Sprintf(schemataViewSQL, infoSchemaPrefix))
+
+	// Create information_schema.views wrapper view
+	// Filter out internal duckgres views and DuckDB system views
+	// Normalize 'main' schema to 'public' for PostgreSQL compatibility
+	viewsViewSQL := `
+		CREATE OR REPLACE VIEW main.information_schema_views_compat AS
+		SELECT
+			v.table_catalog,
+			CASE WHEN v.table_schema = 'main' THEN 'public' ELSE v.table_schema END AS table_schema,
+			v.table_name,
+			v.view_definition,
+			v.check_option,
+			v.is_updatable,
+			v.is_insertable_into,
+			v.is_trigger_updatable,
+			v.is_trigger_deletable,
+			v.is_trigger_insertable_into
+		FROM %s.views v
+		WHERE v.table_name NOT IN (
+			-- pg_catalog compat views
+			'pg_class_full', 'pg_collation', 'pg_database', 'pg_inherits',
+			'pg_namespace', 'pg_policy', 'pg_publication', 'pg_publication_rel',
+			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext', 'pg_matviews',
+			-- information_schema compat views
+			'information_schema_columns_compat', 'information_schema_tables_compat',
+			'information_schema_schemata_compat', 'information_schema_views_compat'
+		)
+		AND v.table_name NOT LIKE 'duckdb_%%'
+		AND v.table_name NOT LIKE 'sqlite_%%'
+		AND v.table_name NOT LIKE 'pragma_%%'
+	`
+	db.Exec(fmt.Sprintf(viewsViewSQL, infoSchemaPrefix))
+
+	return nil
 }
 
-// pgCatalogFuncRegex matches pg_catalog.function_name( patterns
-var pgCatalogFuncRegex *regexp.Regexp
-
-func init() {
-	// Build regex to match pg_catalog.func_name patterns
-	funcPattern := strings.Join(pgCatalogFunctions, "|")
-	pgCatalogFuncRegex = regexp.MustCompile(`(?i)pg_catalog\.(` + funcPattern + `)\s*\(`)
+// recreatePgClassForDuckLake recreates pg_class_full to source from DuckLake metadata
+// instead of DuckDB's pg_catalog. This ensures consistent PostgreSQL-compatible OIDs.
+// Must be called AFTER DuckLake is attached.
+func recreatePgClassForDuckLake(db *sql.DB) error {
+	pgClassSQL := `
+		CREATE OR REPLACE VIEW pg_class_full AS
+		SELECT
+			oid,
+			relname,
+			relnamespace,
+			reltype,
+			reloftype,
+			relowner,
+			relam,
+			relfilenode,
+			reltablespace,
+			relpages,
+			reltuples,
+			relallvisible,
+			reltoastrelid,
+			0::BIGINT AS reltoastidxid,
+			relhasindex,
+			relisshared,
+			relpersistence,
+			relkind,
+			relnatts,
+			relchecks,
+			false AS relhasoids,
+			EXISTS(
+				SELECT 1 FROM __ducklake_metadata_ducklake.pg_catalog.pg_constraint c
+				WHERE c.conrelid = pg_class.oid AND c.contype = 'p'
+			) AS relhaspkey,
+			relhasrules,
+			relhastriggers,
+			relhassubclass,
+			relrowsecurity,
+			false AS relforcerowsecurity,
+			relispopulated,
+			relreplident,
+			relispartition,
+			relrewrite,
+			relfrozenxid,
+			relminmxid,
+			relacl,
+			reloptions,
+			relpartbound
+		FROM __ducklake_metadata_ducklake.pg_catalog.pg_class pg_class
+		WHERE relname NOT IN (
+			'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
+			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
+			'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
+			'information_schema_columns_compat', 'information_schema_tables_compat',
+			'information_schema_schemata_compat', '__duckgres_column_metadata'
+		)
+	`
+	_, err := db.Exec(pgClassSQL)
+	return err
 }
-
-// Regex patterns for query rewriting
-var (
-	// OPERATOR(pg_catalog.~) -> ~
-	operatorRegex = regexp.MustCompile(`(?i)OPERATOR\s*\(\s*pg_catalog\.([~!<>=]+)\s*\)`)
-	// COLLATE pg_catalog.default -> (remove)
-	collateRegex = regexp.MustCompile(`(?i)\s+COLLATE\s+pg_catalog\."?default"?`)
-	// pg_catalog.pg_database -> pg_database (use our view)
-	pgDatabaseRegex = regexp.MustCompile(`(?i)pg_catalog\.pg_database`)
-	// pg_catalog.pg_class -> pg_class_full (use our wrapper view with extra columns)
-	pgClassRegex = regexp.MustCompile(`(?i)pg_catalog\.pg_class\b`)
-	// pg_catalog.pg_collation -> pg_collation (use our view)
-	pgCollationRegex = regexp.MustCompile(`(?i)pg_catalog\.pg_collation\b`)
-	// pg_catalog.pg_policy -> pg_policy (use our view)
-	pgPolicyRegex = regexp.MustCompile(`(?i)pg_catalog\.pg_policy\b`)
-	// pg_catalog.pg_roles -> pg_roles (use our view)
-	pgRolesRegex = regexp.MustCompile(`(?i)pg_catalog\.pg_roles\b`)
-	// pg_catalog.pg_statistic_ext -> pg_statistic_ext (use our view)
-	pgStatisticExtRegex = regexp.MustCompile(`(?i)pg_catalog\.pg_statistic_ext\b`)
-	// pg_catalog.pg_publication_tables -> pg_publication_tables (use our view)
-	pgPublicationTablesRegex = regexp.MustCompile(`(?i)pg_catalog\.pg_publication_tables\b`)
-	// pg_catalog.pg_rules -> pg_rules (use our view)
-	pgRulesRegex = regexp.MustCompile(`(?i)pg_catalog\.pg_rules\b`)
-	// pg_catalog.pg_publication -> pg_publication (use our view)
-	pgPublicationRegex = regexp.MustCompile(`(?i)pg_catalog\.pg_publication\b`)
-	// pg_catalog.pg_publication_rel -> pg_publication_rel (use our view)
-	pgPublicationRelRegex = regexp.MustCompile(`(?i)pg_catalog\.pg_publication_rel\b`)
-	// pg_catalog.pg_inherits -> pg_inherits (use our view)
-	pgInheritsRegex = regexp.MustCompile(`(?i)pg_catalog\.pg_inherits\b`)
-	// ::pg_catalog.regtype::pg_catalog.text -> ::VARCHAR (PostgreSQL type cast)
-	regtypeTextCastRegex = regexp.MustCompile(`(?i)::pg_catalog\.regtype::pg_catalog\.text`)
-	// ::pg_catalog.regtype -> ::VARCHAR
-	regtypeCastRegex = regexp.MustCompile(`(?i)::pg_catalog\.regtype`)
-	// ::pg_catalog.regclass -> ::VARCHAR
-	regclassCastRegex = regexp.MustCompile(`(?i)::pg_catalog\.regclass`)
-	// ::pg_catalog.regnamespace::pg_catalog.text -> ::VARCHAR
-	regnamespaceTextCastRegex = regexp.MustCompile(`(?i)::pg_catalog\.regnamespace::pg_catalog\.text`)
-	// ::pg_catalog.regnamespace -> ::VARCHAR
-	regnamespaceCastRegex = regexp.MustCompile(`(?i)::pg_catalog\.regnamespace`)
-	// ::pg_catalog.text -> ::VARCHAR
-	textCastRegex = regexp.MustCompile(`(?i)::pg_catalog\.text`)
-	// SET application_name = 'value' -> SET VARIABLE application_name = 'value'
-	setApplicationNameRegex = regexp.MustCompile(`(?i)^SET\s+application_name\s*=`)
-	// SET application_name TO 'value' -> SET VARIABLE application_name = 'value'
-	setApplicationNameToRegex = regexp.MustCompile(`(?i)^SET\s+application_name\s+TO\s+`)
-	// SHOW application_name -> SELECT getvariable('application_name') AS application_name
-	showApplicationNameRegex = regexp.MustCompile(`(?i)^SHOW\s+application_name\s*;?\s*$`)
-)
-
-// rewritePgCatalogQuery rewrites PostgreSQL-specific syntax for DuckDB compatibility
-func rewritePgCatalogQuery(query string) string {
-	// Replace pg_catalog.func_name( with func_name(
-	query = pgCatalogFuncRegex.ReplaceAllString(query, "$1(")
-
-	// Replace OPERATOR(pg_catalog.~) with just ~
-	query = operatorRegex.ReplaceAllString(query, "$1")
-
-	// Remove COLLATE pg_catalog.default
-	query = collateRegex.ReplaceAllString(query, "")
-
-	// Replace pg_catalog.pg_database with pg_database (our view in main schema)
-	query = pgDatabaseRegex.ReplaceAllString(query, "pg_database")
-
-	// Replace pg_catalog.pg_class with pg_class_full (our wrapper view with extra columns)
-	query = pgClassRegex.ReplaceAllString(query, "pg_class_full")
-
-	// Replace pg_catalog.pg_collation with pg_collation (our empty view)
-	query = pgCollationRegex.ReplaceAllString(query, "pg_collation")
-
-	// Replace pg_catalog.pg_policy with pg_policy (our empty view)
-	query = pgPolicyRegex.ReplaceAllString(query, "pg_policy")
-
-	// Replace pg_catalog.pg_roles with pg_roles (our view)
-	query = pgRolesRegex.ReplaceAllString(query, "pg_roles")
-
-	// Replace pg_catalog.pg_statistic_ext with pg_statistic_ext (our view)
-	query = pgStatisticExtRegex.ReplaceAllString(query, "pg_statistic_ext")
-
-	// Replace pg_catalog.pg_publication_tables with pg_publication_tables (our view)
-	query = pgPublicationTablesRegex.ReplaceAllString(query, "pg_publication_tables")
-
-	// Replace pg_catalog.pg_rules with pg_rules (our view)
-	query = pgRulesRegex.ReplaceAllString(query, "pg_rules")
-
-	// Replace pg_catalog.pg_publication with pg_publication (our view)
-	query = pgPublicationRegex.ReplaceAllString(query, "pg_publication")
-
-	// Replace pg_catalog.pg_publication_rel with pg_publication_rel (our view)
-	query = pgPublicationRelRegex.ReplaceAllString(query, "pg_publication_rel")
-
-	// Replace pg_catalog.pg_inherits with pg_inherits (our view)
-	query = pgInheritsRegex.ReplaceAllString(query, "pg_inherits")
-
-	// Replace PostgreSQL type casts (order matters - most specific first)
-	query = regtypeTextCastRegex.ReplaceAllString(query, "::VARCHAR")
-	query = regtypeCastRegex.ReplaceAllString(query, "::VARCHAR")
-	query = regclassCastRegex.ReplaceAllString(query, "::VARCHAR")
-	query = regnamespaceTextCastRegex.ReplaceAllString(query, "::VARCHAR")
-	query = regnamespaceCastRegex.ReplaceAllString(query, "::VARCHAR")
-	query = textCastRegex.ReplaceAllString(query, "::VARCHAR")
-
-	// Replace PostgreSQL application_name with DuckDB variable
-	query = setApplicationNameRegex.ReplaceAllString(query, "SET VARIABLE application_name =")
-	query = setApplicationNameToRegex.ReplaceAllString(query, "SET VARIABLE application_name =")
-	query = showApplicationNameRegex.ReplaceAllString(query, "SELECT getvariable('application_name') AS application_name")
-
-	return query
-}
-

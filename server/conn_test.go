@@ -1,8 +1,40 @@
 package server
 
 import (
+	"encoding/csv"
+	"io"
+	"strings"
 	"testing"
 )
+
+func TestIsEmptyQuery(t *testing.T) {
+	tests := []struct {
+		name     string
+		query    string
+		expected bool
+	}{
+		{"empty string", "", true},
+		{"single semicolon", ";", true},
+		{"multiple semicolons", ";;;", true},
+		{"semicolons with spaces", "; ; ;", true},
+		{"semicolons with tabs", ";\t;\t;", true},
+		{"semicolons with newlines", ";\n;\n;", true},
+		{"only whitespace", "   \t\n", true},
+		{"SELECT query", "SELECT 1", false},
+		{"SELECT with semicolon", "SELECT 1;", false},
+		{"comment", "/* comment */", false},
+		{"semicolon then query", ";SELECT 1", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isEmptyQuery(tt.query)
+			if result != tt.expected {
+				t.Errorf("isEmptyQuery(%q) = %v, want %v", tt.query, result, tt.expected)
+			}
+		})
+	}
+}
 
 func TestStripLeadingComments(t *testing.T) {
 	tests := []struct {
@@ -110,6 +142,21 @@ func TestGetCommandType(t *testing.T) {
 		{
 			name:     "CREATE TABLE",
 			query:    "CREATE TABLE users (id INT)",
+			expected: "CREATE TABLE",
+		},
+		{
+			name:     "CREATE TEMPORARY TABLE",
+			query:    "CREATE TEMPORARY TABLE temp_users (id INT)",
+			expected: "CREATE TABLE",
+		},
+		{
+			name:     "CREATE TEMP TABLE",
+			query:    "CREATE TEMP TABLE temp_users (id INT)",
+			expected: "CREATE TABLE",
+		},
+		{
+			name:     "CREATE TEMPORARY TABLE with Fivetran comment",
+			query:    "/*Fivetran*/CREATE TEMPORARY TABLE temp_users (id INT)",
 			expected: "CREATE TABLE",
 		},
 		{
@@ -330,5 +377,358 @@ func TestTransactionErrorStatus(t *testing.T) {
 	c.updateTxStatus("ROLLBACK")
 	if c.txStatus != txStatusIdle {
 		t.Errorf("after ROLLBACK from error txStatus = %c, want %c", c.txStatus, txStatusIdle)
+	}
+}
+
+func TestNestedBeginDetection(t *testing.T) {
+	// Test that we can detect when a nested BEGIN would occur
+	// The actual warning is sent in handleQuery, but we test the detection logic here
+	c := &clientConn{txStatus: txStatusIdle}
+
+	// First BEGIN should work normally
+	c.updateTxStatus("BEGIN")
+	if c.txStatus != txStatusTransaction {
+		t.Errorf("after first BEGIN txStatus = %c, want %c", c.txStatus, txStatusTransaction)
+	}
+
+	// At this point, a second BEGIN should trigger warning behavior
+	// In handleQuery, when cmdType == "BEGIN" && c.txStatus == txStatusTransaction,
+	// we send a warning and return success without calling DuckDB
+	isNestedBegin := c.txStatus == txStatusTransaction
+	if !isNestedBegin {
+		t.Error("expected nested BEGIN to be detected")
+	}
+
+	// Transaction status should remain 'T' (not change to 'I' or 'E')
+	// The warning is sent but the transaction continues
+	if c.txStatus != txStatusTransaction {
+		t.Errorf("txStatus should still be %c after nested BEGIN detection, got %c", txStatusTransaction, c.txStatus)
+	}
+}
+
+func TestQueryReturnsResults(t *testing.T) {
+	tests := []struct {
+		name     string
+		query    string
+		expected bool
+	}{
+		// SELECT queries
+		{
+			name:     "simple SELECT",
+			query:    "SELECT * FROM users",
+			expected: true,
+		},
+		{
+			name:     "SELECT with comment",
+			query:    "/*Fivetran*/ SELECT * FROM users",
+			expected: true,
+		},
+		{
+			name:     "SELECT with block and line comment",
+			query:    "/* comment */ -- line\nSELECT 1",
+			expected: true,
+		},
+		// WITH/CTE queries
+		{
+			name:     "WITH clause",
+			query:    "WITH cte AS (SELECT 1) SELECT * FROM cte",
+			expected: true,
+		},
+		{
+			name:     "WITH clause with comment",
+			query:    "/*Fivetran*/ WITH cte AS (SELECT 1) SELECT * FROM cte",
+			expected: true,
+		},
+		// VALUES
+		{
+			name:     "VALUES",
+			query:    "VALUES (1, 2), (3, 4)",
+			expected: true,
+		},
+		// SHOW
+		{
+			name:     "SHOW",
+			query:    "SHOW TABLES",
+			expected: true,
+		},
+		// TABLE
+		{
+			name:     "TABLE command",
+			query:    "TABLE users",
+			expected: true,
+		},
+		// EXPLAIN
+		{
+			name:     "EXPLAIN",
+			query:    "EXPLAIN SELECT * FROM users",
+			expected: true,
+		},
+		// DESCRIBE
+		{
+			name:     "DESCRIBE",
+			query:    "DESCRIBE users",
+			expected: true,
+		},
+		// Non-result queries
+		{
+			name:     "INSERT",
+			query:    "INSERT INTO users VALUES (1)",
+			expected: false,
+		},
+		{
+			name:     "UPDATE",
+			query:    "UPDATE users SET name = 'test'",
+			expected: false,
+		},
+		{
+			name:     "DELETE",
+			query:    "DELETE FROM users",
+			expected: false,
+		},
+		{
+			name:     "CREATE TABLE",
+			query:    "CREATE TABLE test (id INT)",
+			expected: false,
+		},
+		{
+			name:     "CREATE TABLE with comment",
+			query:    "/*Fivetran*/ CREATE TABLE test (id INT)",
+			expected: false,
+		},
+		{
+			name:     "DROP TABLE",
+			query:    "DROP TABLE users",
+			expected: false,
+		},
+		{
+			name:     "BEGIN",
+			query:    "BEGIN",
+			expected: false,
+		},
+		{
+			name:     "COMMIT",
+			query:    "COMMIT",
+			expected: false,
+		},
+		{
+			name:     "ROLLBACK",
+			query:    "ROLLBACK",
+			expected: false,
+		},
+		{
+			name:     "SET",
+			query:    "SET search_path = public",
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := queryReturnsResults(tt.query)
+			if result != tt.expected {
+				t.Errorf("queryReturnsResults(%q) = %v, want %v", tt.query, result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestQueryReturnsResultsWithComments verifies that queries with leading comments
+// are correctly identified as result-returning queries.
+func TestQueryReturnsResultsWithComments(t *testing.T) {
+	tests := []struct {
+		name     string
+		query    string
+		expected bool
+	}{
+		// Queries with leading comments that return results
+		{"block comment before SELECT", "/* comment */ SELECT * FROM users", true},
+		{"block comment before SELECT no space", "/*comment*/SELECT 1", true},
+		{"block comment before WITH", "/* query */ WITH cte AS (SELECT 1) SELECT * FROM cte", true},
+		{"line comment before SELECT", "-- comment\nSELECT * FROM users", true},
+		{"multiple block comments", "/* first */ /* second */ SELECT 1", true},
+		{"block comment before SHOW", "/* comment */ SHOW TABLES", true},
+		{"block comment before VALUES", "/* comment */ VALUES (1, 2)", true},
+
+		// Queries with leading comments that don't return results
+		{"block comment before INSERT", "/* comment */ INSERT INTO t VALUES (1)", false},
+		{"block comment before CREATE", "/* comment */ CREATE TABLE t (id INT)", false},
+		{"block comment before DROP", "/* comment */ DROP TABLE t", false},
+		{"block comment before BEGIN", "/* comment */ BEGIN", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := queryReturnsResults(tt.query)
+			if result != tt.expected {
+				t.Errorf("queryReturnsResults(%q) = %v, want %v", tt.query, result, tt.expected)
+			}
+		})
+	}
+}
+
+// Note: isIgnoredSetParameter tests have been moved to transpiler/transpiler_test.go.
+// The transpiler package now handles SET parameter filtering via AST transformation.
+
+func TestParseCopyLine(t *testing.T) {
+	c := &clientConn{}
+
+	tests := []struct {
+		name      string
+		line      string
+		delimiter string
+		expected  []string
+	}{
+		{
+			name:      "simple CSV values",
+			line:      `a,b,c`,
+			delimiter: ",",
+			expected:  []string{"a", "b", "c"},
+		},
+		{
+			name:      "quoted value with embedded comma",
+			line:      `"hello, world",normal,value`,
+			delimiter: ",",
+			expected:  []string{"hello, world", "normal", "value"},
+		},
+		{
+			name:      "multiple quoted values with commas",
+			line:      `"value, one","value, two","value, three"`,
+			delimiter: ",",
+			expected:  []string{"value, one", "value, two", "value, three"},
+		},
+		{
+			name:      "mixed quoted and unquoted",
+			line:      `id,"url with, comma",status`,
+			delimiter: ",",
+			expected:  []string{"id", "url with, comma", "status"},
+		},
+		{
+			name:      "tab-separated values",
+			line:      "a\tb\tc",
+			delimiter: "\t",
+			expected:  []string{"a", "b", "c"},
+		},
+		{
+			name:      "quoted value with embedded tab",
+			line:      "\"hello\tworld\"\tnormal",
+			delimiter: "\t",
+			expected:  []string{"hello\tworld", "normal"},
+		},
+		{
+			name:      "empty values",
+			line:      `a,,c`,
+			delimiter: ",",
+			expected:  []string{"a", "", "c"},
+		},
+		{
+			name:      "URL with comma in quoted field",
+			line:      `"cs_123","https://example.com/success?a=1,b=2",active`,
+			delimiter: ",",
+			expected:  []string{"cs_123", "https://example.com/success?a=1,b=2", "active"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := c.parseCopyLine(tt.line, tt.delimiter)
+			if len(result) != len(tt.expected) {
+				t.Errorf("parseCopyLine(%q, %q) returned %d values, want %d\nGot: %v\nWant: %v",
+					tt.line, tt.delimiter, len(result), len(tt.expected), result, tt.expected)
+				return
+			}
+			for i, v := range result {
+				if v != tt.expected[i] {
+					t.Errorf("parseCopyLine(%q, %q)[%d] = %q, want %q",
+						tt.line, tt.delimiter, i, v, tt.expected[i])
+				}
+			}
+		})
+	}
+}
+
+func TestParseMultiLineCSV(t *testing.T) {
+	// This tests the fix for COPY FROM STDIN with multi-line quoted fields.
+	// Previously, we split by newlines first then parsed each line, which broke
+	// when quoted fields contained embedded newlines (e.g., JSON with formatting).
+	// Now we use csv.Reader on the entire buffer which handles this correctly.
+
+	tests := []struct {
+		name      string
+		input     string
+		delimiter string
+		expected  [][]string
+	}{
+		{
+			name:      "simple rows no newlines",
+			input:     "a,b,c\n1,2,3\n",
+			delimiter: ",",
+			expected:  [][]string{{"a", "b", "c"}, {"1", "2", "3"}},
+		},
+		{
+			name:      "quoted field with embedded newline",
+			input:     "id,json,status\n1,\"{\"\"key\"\":\n\"\"value\"\"}\",active\n",
+			delimiter: ",",
+			expected:  [][]string{{"id", "json", "status"}, {"1", "{\"key\":\n\"value\"}", "active"}},
+		},
+		{
+			name:      "multiple fields with newlines",
+			input:     "a,\"line1\nline2\",b\nc,\"x\ny\nz\",d\n",
+			delimiter: ",",
+			expected:  [][]string{{"a", "line1\nline2", "b"}, {"c", "x\ny\nz", "d"}},
+		},
+		{
+			name:      "JSON metadata like Fivetran sends",
+			input:     "customer_id,metadata,type\ncust_123,\"{\"\"subscription\"\":\n  \"\"active\"\",\n  \"\"plan\"\": \"\"pro\"\"}\",invoice\n",
+			delimiter: ",",
+			expected:  [][]string{{"customer_id", "metadata", "type"}, {"cust_123", "{\"subscription\":\n  \"active\",\n  \"plan\": \"pro\"}", "invoice"}},
+		},
+		{
+			name:      "13 columns with multiline JSON in middle",
+			input:     "c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11,c12,c13\nv1,v2,v3,v4,v5,v6,\"{\"\"a\"\":\n\"\"b\"\"}\",v8,v9,v10,v11,v12,v13\n",
+			delimiter: ",",
+			expected:  [][]string{{"c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11", "c12", "c13"}, {"v1", "v2", "v3", "v4", "v5", "v6", "{\"a\":\n\"b\"}", "v8", "v9", "v10", "v11", "v12", "v13"}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Simulate what handleCopyIn does: use csv.Reader on entire buffer
+			reader := csv.NewReader(strings.NewReader(tt.input))
+			reader.Comma = rune(tt.delimiter[0])
+			reader.LazyQuotes = true
+			reader.FieldsPerRecord = -1
+
+			var rows [][]string
+			for {
+				record, err := reader.Read()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					t.Fatalf("csv.Read() error: %v", err)
+				}
+				rows = append(rows, record)
+			}
+
+			if len(rows) != len(tt.expected) {
+				t.Errorf("got %d rows, want %d\nGot: %v\nWant: %v",
+					len(rows), len(tt.expected), rows, tt.expected)
+				return
+			}
+
+			for i, row := range rows {
+				if len(row) != len(tt.expected[i]) {
+					t.Errorf("row %d: got %d columns, want %d\nGot: %v\nWant: %v",
+						i, len(row), len(tt.expected[i]), row, tt.expected[i])
+					continue
+				}
+				for j, val := range row {
+					if val != tt.expected[i][j] {
+						t.Errorf("row %d col %d: got %q, want %q",
+							i, j, val, tt.expected[i][j])
+					}
+				}
+			}
+		})
 	}
 }

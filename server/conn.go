@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"database/sql"
 	"encoding/binary"
+	"encoding/csv"
 	"fmt"
 	"io"
 	"log"
@@ -13,13 +14,20 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
+
+	"github.com/posthog/duckgres/transpiler"
 )
 
 type preparedStmt struct {
-	query         string
+	query          string
 	convertedQuery string
-	paramTypes    []int32
-	numParams     int
+	paramTypes     []int32
+	numParams      int
+	isIgnoredSet   bool   // True if this is an ignored SET parameter
+	isNoOp         bool   // True if this is a no-op command (CREATE INDEX, etc.)
+	noOpTag        string // Command tag for no-op commands
+	described      bool   // True if Describe(S) was called on this statement
 }
 
 type portal struct {
@@ -50,6 +58,14 @@ type clientConn struct {
 	txStatus   byte                     // current transaction status ('I', 'T', or 'E')
 }
 
+// newTranspiler creates a transpiler configured for this connection.
+func (c *clientConn) newTranspiler(convertPlaceholders bool) *transpiler.Transpiler {
+	return transpiler.New(transpiler.Config{
+		DuckLakeMode:        c.server.cfg.DuckLake.MetadataStore != "",
+		ConvertPlaceholders: convertPlaceholders,
+	})
+}
+
 func (c *clientConn) serve() error {
 	c.reader = bufio.NewReader(c.conn)
 	c.writer = bufio.NewWriter(c.conn)
@@ -63,20 +79,25 @@ func (c *clientConn) serve() error {
 		return fmt.Errorf("startup failed: %w", err)
 	}
 
-	// Create a new DuckDB connection for this client session.
-	// Each client gets its own connection to ensure proper isolation of
-	// temporary tables and session state, matching PostgreSQL's behavior.
+	// Create a DuckDB connection for this client session
 	db, err := c.server.createDBConnection(c.username)
 	if err != nil {
 		c.sendError("FATAL", "28000", fmt.Sprintf("failed to open database: %v", err))
 		return err
 	}
 	c.db = db
-	// Ensure the database connection is closed when this client disconnects
 	defer func() {
 		if c.db != nil {
+			// Detach DuckLake to release the RDS metadata connection
+			if c.server.cfg.DuckLake.MetadataStore != "" {
+				// Must switch away from ducklake before detaching - DuckDB doesn't allow
+				// detaching the default database
+				c.db.Exec("USE memory")
+				if _, err := c.db.Exec("DETACH ducklake"); err != nil {
+					log.Printf("Warning: failed to detach DuckLake for user %q: %v", c.username, err)
+				}
+			}
 			c.db.Close()
-			log.Printf("Closed DuckDB connection for user %q", c.username)
 		}
 	}()
 
@@ -212,9 +233,19 @@ func (c *clientConn) sendInitialParams() {
 
 func (c *clientConn) messageLoop() error {
 	for {
+		// Set read deadline if idle timeout is configured
+		if c.server.cfg.IdleTimeout > 0 {
+			c.conn.SetReadDeadline(time.Now().Add(c.server.cfg.IdleTimeout))
+		}
+
 		msgType, body, err := readMessage(c.reader)
 		if err != nil {
 			if err == io.EOF {
+				return nil
+			}
+			// Check if this is a timeout error
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				log.Printf("[%s] Connection idle timeout, closing", c.username)
 				return nil
 			}
 			return err
@@ -269,7 +300,9 @@ func (c *clientConn) handleQuery(body []byte) error {
 	query := string(bytes.TrimRight(body, "\x00"))
 	query = strings.TrimSpace(query)
 
-	if query == "" {
+	// Treat empty queries or queries with just semicolons as empty
+	// PostgreSQL returns EmptyQueryResponse for queries like "" or ";" or ";;;"
+	if query == "" || isEmptyQuery(query) {
 		writeEmptyQueryResponse(c.writer)
 		writeReadyForQuery(c.writer, c.txStatus)
 		c.writer.Flush()
@@ -278,8 +311,51 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 	log.Printf("[%s] Query: %s", c.username, query)
 
-	// Rewrite pg_catalog function calls for compatibility
-	query = rewritePgCatalogQuery(query)
+	// Transpile PostgreSQL SQL to DuckDB-compatible SQL
+	tr := c.newTranspiler(false)
+	result, err := tr.Transpile(query)
+	if err != nil {
+		// Parse error - send error to client
+		c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
+		writeReadyForQuery(c.writer, c.txStatus)
+		c.writer.Flush()
+		return nil
+	}
+
+	// Handle transform-detected errors (e.g., unrecognized config parameter)
+	if result.Error != nil {
+		c.sendError("ERROR", "42704", result.Error.Error())
+		writeReadyForQuery(c.writer, c.txStatus)
+		c.writer.Flush()
+		return nil
+	}
+
+	// Handle ignored SET parameters
+	if result.IsIgnoredSet {
+		log.Printf("[%s] Ignoring PostgreSQL-specific SET: %s", c.username, query)
+		writeCommandComplete(c.writer, "SET")
+		writeReadyForQuery(c.writer, c.txStatus)
+		c.writer.Flush()
+		return nil
+	}
+
+	// Handle no-op commands (CREATE INDEX, VACUUM, etc.)
+	if result.IsNoOp {
+		log.Printf("[%s] No-op command (DuckLake limitation): %s", c.username, query)
+		writeCommandComplete(c.writer, result.NoOpTag)
+		writeReadyForQuery(c.writer, c.txStatus)
+		c.writer.Flush()
+		return nil
+	}
+
+	// Use the transpiled SQL
+	originalQuery := query
+	query = result.SQL
+
+	// Log the transpiled query if it differs from the original
+	if query != originalQuery {
+		log.Printf("[%s] Executed: %s", c.username, query)
+	}
 
 	// Determine command type for proper response
 	upperQuery := strings.ToUpper(query)
@@ -292,6 +368,16 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 	// For non-SELECT queries, use Exec
 	if cmdType != "SELECT" {
+		// Handle nested BEGIN: PostgreSQL issues a warning but continues,
+		// while DuckDB throws an error. Match PostgreSQL behavior.
+		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
+			c.sendNotice("WARNING", "25001", "there is already a transaction in progress")
+			writeCommandComplete(c.writer, "BEGIN")
+			writeReadyForQuery(c.writer, c.txStatus)
+			c.writer.Flush()
+			return nil
+		}
+
 		result, err := c.db.Exec(query)
 		if err != nil {
 			c.sendError("ERROR", "42000", err.Error())
@@ -373,6 +459,17 @@ func (c *clientConn) handleQuery(body []byte) error {
 	return nil
 }
 
+// isEmptyQuery checks if a query contains only semicolons and whitespace.
+// PostgreSQL returns EmptyQueryResponse for queries like ";" or ";;;" or "; ; ;"
+func isEmptyQuery(query string) bool {
+	for _, r := range query {
+		if r != ';' && r != ' ' && r != '\t' && r != '\n' && r != '\r' {
+			return false
+		}
+	}
+	return true
+}
+
 // stripLeadingComments removes leading SQL comments from a query.
 // Handles both block comments /* ... */ and line comments -- ...
 func stripLeadingComments(query string) string {
@@ -396,6 +493,45 @@ func stripLeadingComments(query string) string {
 	}
 }
 
+// queryReturnsResults checks if a SQL query returns a result set.
+// This is used to determine whether to send RowDescription or NoData.
+func queryReturnsResults(query string) bool {
+	upper := strings.ToUpper(stripLeadingComments(query))
+	// SELECT is the most common
+	if strings.HasPrefix(upper, "SELECT") {
+		return true
+	}
+	// WITH ... SELECT (CTEs)
+	if strings.HasPrefix(upper, "WITH") {
+		return true
+	}
+	// VALUES clause returns rows
+	if strings.HasPrefix(upper, "VALUES") {
+		return true
+	}
+	// SHOW commands return results
+	if strings.HasPrefix(upper, "SHOW") {
+		return true
+	}
+	// TABLE is shorthand for SELECT * FROM table
+	if strings.HasPrefix(upper, "TABLE") {
+		return true
+	}
+	// EXECUTE can return results if the prepared statement is a SELECT
+	if strings.HasPrefix(upper, "EXECUTE") {
+		return true
+	}
+	// EXPLAIN returns results
+	if strings.HasPrefix(upper, "EXPLAIN") {
+		return true
+	}
+	// DESCRIBE returns results (DuckDB-specific)
+	if strings.HasPrefix(upper, "DESCRIBE") {
+		return true
+	}
+	return false
+}
+
 func (c *clientConn) getCommandType(upperQuery string) string {
 	// Strip leading comments like /*Fivetran*/ before checking command type
 	upperQuery = stripLeadingComments(upperQuery)
@@ -409,11 +545,16 @@ func (c *clientConn) getCommandType(upperQuery string) string {
 		return "UPDATE"
 	case strings.HasPrefix(upperQuery, "DELETE"):
 		return "DELETE"
-	case strings.HasPrefix(upperQuery, "CREATE TABLE"):
+	case strings.HasPrefix(upperQuery, "CREATE TABLE"),
+		strings.HasPrefix(upperQuery, "CREATE TEMPORARY TABLE"),
+		strings.HasPrefix(upperQuery, "CREATE TEMP TABLE"),
+		strings.HasPrefix(upperQuery, "CREATE UNLOGGED TABLE"):
 		return "CREATE TABLE"
-	case strings.HasPrefix(upperQuery, "CREATE INDEX"):
+	case strings.HasPrefix(upperQuery, "CREATE INDEX"),
+		strings.HasPrefix(upperQuery, "CREATE UNIQUE INDEX"):
 		return "CREATE INDEX"
-	case strings.HasPrefix(upperQuery, "CREATE VIEW"):
+	case strings.HasPrefix(upperQuery, "CREATE VIEW"),
+		strings.HasPrefix(upperQuery, "CREATE OR REPLACE VIEW"):
 		return "CREATE VIEW"
 	case strings.HasPrefix(upperQuery, "CREATE SCHEMA"):
 		return "CREATE SCHEMA"
@@ -429,6 +570,12 @@ func (c *clientConn) getCommandType(upperQuery string) string {
 		return "DROP SCHEMA"
 	case strings.HasPrefix(upperQuery, "DROP"):
 		return "DROP"
+	case strings.Contains(upperQuery, "ADD CONSTRAINT") ||
+		strings.Contains(upperQuery, "ADD PRIMARY KEY") ||
+		strings.Contains(upperQuery, "ADD UNIQUE") ||
+		strings.Contains(upperQuery, "ADD FOREIGN KEY") ||
+		strings.Contains(upperQuery, "ADD CHECK"):
+		return "ALTER TABLE ADD CONSTRAINT"
 	case strings.HasPrefix(upperQuery, "ALTER"):
 		return "ALTER TABLE"
 	case strings.HasPrefix(upperQuery, "TRUNCATE"):
@@ -487,10 +634,11 @@ func (c *clientConn) buildCommandTag(cmdType string, result sql.Result) string {
 // Regular expressions for parsing COPY commands
 var (
 	copyToStdoutRegex   = regexp.MustCompile(`(?i)COPY\s+(.+?)\s+TO\s+STDOUT`)
-	copyFromStdinRegex  = regexp.MustCompile(`(?i)COPY\s+(\S+)\s+(?:\(([^)]+)\)\s+)?FROM\s+STDIN`)
+	copyFromStdinRegex  = regexp.MustCompile(`(?i)COPY\s+(\S+)\s*(?:\(([^)]+)\)\s*)?FROM\s+STDIN`)
 	copyWithCSVRegex    = regexp.MustCompile(`(?i)\bCSV\b`)
 	copyWithHeaderRegex = regexp.MustCompile(`(?i)\bHEADER\b`)
 	copyDelimiterRegex  = regexp.MustCompile(`(?i)\bDELIMITER\s+['"](.)['"]\b`)
+	copyNullRegex       = regexp.MustCompile(`(?i)\bNULL\s+'([^']*)'`)
 )
 
 // handleCopy handles COPY TO STDOUT and COPY FROM STDIN commands
@@ -623,6 +771,9 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 
 // handleCopyIn handles COPY ... FROM STDIN
 func (c *clientConn) handleCopyIn(query, upperQuery string) error {
+	copyStartTime := time.Now()
+	log.Printf("[%s] COPY FROM STDIN: starting", c.username)
+
 	matches := copyFromStdinRegex.FindStringSubmatch(query)
 	if len(matches) < 2 {
 		c.sendError("ERROR", "42601", "Invalid COPY FROM STDIN syntax")
@@ -637,6 +788,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	if len(matches) > 2 && matches[2] != "" {
 		columnList = fmt.Sprintf("(%s)", matches[2])
 	}
+	log.Printf("[%s] COPY FROM STDIN: table=%s columns=%s", c.username, tableName, columnList)
 
 	// Parse options
 	delimiter := "\t"
@@ -646,6 +798,12 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 		delimiter = ","
 	}
 	hasHeader := copyWithCSVRegex.MatchString(upperQuery) && copyWithHeaderRegex.MatchString(upperQuery)
+
+	// Parse NULL string option (e.g., NULL 'custom-null-value')
+	nullString := "\\N" // Default PostgreSQL null representation
+	if m := copyNullRegex.FindStringSubmatch(query); len(m) > 1 {
+		nullString = m[1]
+	}
 
 	// Get column count for the table
 	colQuery := fmt.Sprintf("SELECT * FROM %s LIMIT 0", tableName)
@@ -665,67 +823,98 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 		return err
 	}
 	c.writer.Flush()
+	log.Printf("[%s] COPY FROM STDIN: sent CopyInResponse, waiting for data...", c.username)
 
-	// Read COPY data from client
-	var allData bytes.Buffer
+	// Create temp file upfront and stream data directly to it (avoids memory buffering)
+	// This approach leverages DuckDB's highly optimized CSV parser which handles
+	// type conversions automatically and can load millions of rows in seconds.
+	tmpFile, err := os.CreateTemp("", "duckgres-copy-*.csv")
+	if err != nil {
+		log.Printf("[%s] COPY FROM STDIN: failed to create temp file: %v", c.username, err)
+		c.sendError("ERROR", "58000", fmt.Sprintf("failed to create temp file: %v", err))
+		c.setTxError()
+		writeReadyForQuery(c.writer, c.txStatus)
+		c.writer.Flush()
+		return nil
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	// Stream COPY data directly to temp file (no memory buffering)
 	rowCount := 0
-	headerSkipped := false
+	copyDataMessages := 0
+	bytesWritten := int64(0)
+	dataReceiveStart := time.Now()
 
 	for {
 		msgType, body, err := readMessage(c.reader)
 		if err != nil {
+			log.Printf("[%s] COPY FROM STDIN: error reading message: %v", c.username, err)
+			tmpFile.Close()
 			return err
 		}
 
 		switch msgType {
 		case msgCopyData:
-			allData.Write(body)
+			n, err := tmpFile.Write(body)
+			if err != nil {
+				log.Printf("[%s] COPY FROM STDIN: failed to write to temp file: %v", c.username, err)
+				tmpFile.Close()
+				c.sendError("ERROR", "58000", fmt.Sprintf("failed to write to temp file: %v", err))
+				c.setTxError()
+				writeReadyForQuery(c.writer, c.txStatus)
+				c.writer.Flush()
+				return nil
+			}
+			bytesWritten += int64(n)
+			copyDataMessages++
+			if copyDataMessages%10000 == 0 {
+				log.Printf("[%s] COPY FROM STDIN: received %d CopyData messages, %d bytes written",
+					c.username, copyDataMessages, bytesWritten)
+			}
 
 		case msgCopyDone:
-			// Process all data
-			lines := strings.Split(allData.String(), "\n")
-			for _, line := range lines {
-				line = strings.TrimSpace(line)
-				if line == "" {
-					continue
-				}
+			tmpFile.Close()
+			dataReceiveElapsed := time.Since(dataReceiveStart)
+			log.Printf("[%s] COPY FROM STDIN: CopyDone received - %d messages, %d bytes in %v",
+				c.username, copyDataMessages, bytesWritten, dataReceiveElapsed)
 
-				// Skip header if needed
-				if hasHeader && !headerSkipped {
-					headerSkipped = true
-					continue
-				}
-
-				// Parse values and insert
-				values := c.parseCopyLine(line, delimiter)
-				if len(values) == 0 {
-					continue
-				}
-
-				// Build INSERT statement
-				placeholders := make([]string, len(values))
-				args := make([]interface{}, len(values))
-				for i, v := range values {
-					placeholders[i] = "?"
-					if v == "\\N" || v == "" {
-						args[i] = nil
-					} else {
-						args[i] = v
-					}
-				}
-
-				insertSQL := fmt.Sprintf("INSERT INTO %s %s VALUES (%s)",
-					tableName, columnList, strings.Join(placeholders, ", "))
-
-				if _, err := c.db.Exec(insertSQL, args...); err != nil {
-					c.sendError("ERROR", "22P02", fmt.Sprintf("invalid input: %v", err))
-					c.setTxError()
-					writeReadyForQuery(c.writer, c.txStatus)
-					c.writer.Flush()
-					return nil
-				}
-				rowCount++
+			// Build DuckDB COPY FROM statement
+			// DuckDB syntax: COPY table FROM 'file' (FORMAT CSV, HEADER, NULL 'value', DELIMITER ',')
+			copyOptions := []string{"FORMAT CSV"}
+			if hasHeader {
+				copyOptions = append(copyOptions, "HEADER")
 			}
+			if nullString != "\\N" {
+				copyOptions = append(copyOptions, fmt.Sprintf("NULL '%s'", nullString))
+			}
+			if delimiter != "," {
+				copyOptions = append(copyOptions, fmt.Sprintf("DELIMITER '%s'", delimiter))
+			}
+
+			copySQL := fmt.Sprintf("COPY %s %s FROM '%s' (%s)",
+				tableName, columnList, tmpPath, strings.Join(copyOptions, ", "))
+
+			log.Printf("[%s] COPY FROM STDIN: executing native DuckDB COPY: %s", c.username, copySQL)
+			loadStart := time.Now()
+
+			result, err := c.db.Exec(copySQL)
+			if err != nil {
+				log.Printf("[%s] COPY FROM STDIN: DuckDB COPY failed: %v", c.username, err)
+				c.sendError("ERROR", "22P02", fmt.Sprintf("COPY failed: %v", err))
+				c.setTxError()
+				writeReadyForQuery(c.writer, c.txStatus)
+				c.writer.Flush()
+				return nil
+			}
+
+			rowCount64, _ := result.RowsAffected()
+			rowCount = int(rowCount64)
+
+			totalElapsed := time.Since(copyStartTime)
+			loadElapsed := time.Since(loadStart)
+			log.Printf("[%s] COPY FROM STDIN: completed - %d rows in %v (DuckDB load: %v)",
+				c.username, rowCount, totalElapsed, loadElapsed)
 
 			writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
 			writeReadyForQuery(c.writer, c.txStatus)
@@ -761,8 +950,17 @@ func (c *clientConn) formatCopyValue(v interface{}) string {
 
 // parseCopyLine parses a line of COPY input
 func (c *clientConn) parseCopyLine(line, delimiter string) []string {
-	// Simple split - doesn't handle quoted values yet
-	return strings.Split(line, delimiter)
+	// Use encoding/csv for proper handling of quoted values
+	reader := csv.NewReader(strings.NewReader(line))
+	reader.Comma = rune(delimiter[0])
+	reader.LazyQuotes = true // Be lenient with quotes
+
+	fields, err := reader.Read()
+	if err != nil {
+		// Fall back to simple split if CSV parsing fails
+		return strings.Split(line, delimiter)
+	}
+	return fields
 }
 
 func (c *clientConn) sendRowDescription(cols []string, colTypes []*sql.ColumnType) error {
@@ -891,6 +1089,16 @@ func formatValue(v interface{}) string {
 			return "t"
 		}
 		return "f"
+	case time.Time:
+		// PostgreSQL timestamp format without timezone suffix
+		if val.IsZero() {
+			return ""
+		}
+		// Use microsecond precision if there are sub-second components
+		if val.Nanosecond() != 0 {
+			return val.Format("2006-01-02 15:04:05.999999")
+		}
+		return val.Format("2006-01-02 15:04:05")
 	default:
 		// For other types, try to convert to string
 		return fmt.Sprintf("%v", val)
@@ -900,6 +1108,11 @@ func formatValue(v interface{}) string {
 func (c *clientConn) sendError(severity, code, message string) {
 	writeErrorResponse(c.writer, severity, code, message)
 	c.writer.Flush()
+}
+
+func (c *clientConn) sendNotice(severity, code, message string) {
+	writeNoticeResponse(c.writer, severity, code, message)
+	// Don't flush here - let the caller decide when to flush
 }
 
 // Extended query protocol handlers
@@ -943,20 +1156,37 @@ func (c *clientConn) handleParse(body []byte) {
 		}
 	}
 
-	// Convert PostgreSQL $1, $2 placeholders to ? for database/sql
-	convertedQuery, numParams := convertPlaceholders(query)
+	// Transpile PostgreSQL SQL to DuckDB-compatible SQL (with placeholder conversion)
+	tr := c.newTranspiler(true) // Enable placeholder conversion for prepared statements
+	result, err := tr.Transpile(query)
+	if err != nil {
+		c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
+		return
+	}
+
+	// Handle transform-detected errors (e.g., unrecognized config parameter)
+	if result.Error != nil {
+		c.sendError("ERROR", "42704", result.Error.Error())
+		return
+	}
 
 	// Close existing statement with same name
 	delete(c.stmts, stmtName)
 
 	c.stmts[stmtName] = &preparedStmt{
-		query:          query,
-		convertedQuery: convertedQuery,
+		query:          query,             // Keep original for logging and Describe
+		convertedQuery: result.SQL,        // Transpiled SQL for execution
 		paramTypes:     paramTypes,
-		numParams:      numParams,
+		numParams:      result.ParamCount,
+		isIgnoredSet:   result.IsIgnoredSet,
+		isNoOp:         result.IsNoOp,
+		noOpTag:        result.NoOpTag,
 	}
 
 	log.Printf("[%s] Prepared statement %q: %s", c.username, stmtName, query)
+	if result.SQL != query {
+		log.Printf("[%s] Prepared statement %q transpiled: %s", c.username, stmtName, result.SQL)
+	}
 	writeParseComplete(c.writer)
 }
 
@@ -1053,6 +1283,7 @@ func (c *clientConn) handleBind(body []byte) {
 		stmt:          ps,
 		paramValues:   paramValues,
 		resultFormats: resultFormats,
+		described:     ps.described, // Inherit from statement if Describe(S) was called
 	}
 
 	writeBindComplete(c.writer)
@@ -1079,6 +1310,8 @@ func (c *clientConn) handleDescribe(body []byte) {
 			c.sendError("ERROR", "26000", fmt.Sprintf("prepared statement %q does not exist", name))
 			return
 		}
+		log.Printf("[%s] Describe statement %q: %s", c.username, name, ps.query)
+
 		// Send parameter description based on the number of $N placeholders we found
 		// If the client didn't send explicit types, create them
 		paramTypes := ps.paramTypes
@@ -1091,10 +1324,11 @@ func (c *clientConn) handleDescribe(body []byte) {
 		}
 		c.sendParameterDescription(paramTypes)
 
-		// For SELECT queries, we need to send RowDescription
+		// For queries that return results, we need to send RowDescription
 		// For other queries, send NoData
-		upperQuery := strings.ToUpper(strings.TrimSpace(ps.query))
-		if !strings.HasPrefix(upperQuery, "SELECT") {
+		returnsResults := queryReturnsResults(ps.query)
+		log.Printf("[%s] Describe statement %q: returnsResults=%v", c.username, name, returnsResults)
+		if !returnsResults {
 			writeNoData(c.writer)
 			return
 		}
@@ -1133,6 +1367,7 @@ func (c *clientConn) handleDescribe(body []byte) {
 
 		log.Printf("[%s] Describe statement: sending RowDescription with %d columns", c.username, len(cols))
 		c.sendRowDescription(cols, colTypes)
+		ps.described = true
 
 	case 'P':
 		// Describe portal
@@ -1142,9 +1377,8 @@ func (c *clientConn) handleDescribe(body []byte) {
 			return
 		}
 
-		// For non-SELECT, send NoData
-		upperQuery := strings.ToUpper(strings.TrimSpace(p.stmt.query))
-		if !strings.HasPrefix(upperQuery, "SELECT") {
+		// For queries that don't return results, send NoData
+		if !queryReturnsResults(p.stmt.query) {
 			writeNoData(c.writer)
 			return
 		}
@@ -1224,13 +1458,39 @@ func (c *clientConn) handleExecute(body []byte) {
 
 	upperQuery := strings.ToUpper(strings.TrimSpace(p.stmt.query))
 	cmdType := c.getCommandType(upperQuery)
+	returnsResults := queryReturnsResults(p.stmt.query)
 
 	log.Printf("[%s] Execute %q with %d params: %s", c.username, portalName, len(args), p.stmt.query)
 
-	if cmdType != "SELECT" {
-		// Non-SELECT: use Exec with converted query
+	// Check if this is a PostgreSQL-specific SET command that should be ignored
+	// (determined by transpiler during Parse)
+	if p.stmt.isIgnoredSet {
+		log.Printf("[%s] Ignoring PostgreSQL-specific SET: %s", c.username, p.stmt.query)
+		writeCommandComplete(c.writer, "SET")
+		return
+	}
+
+	// Handle no-op commands (CREATE INDEX, VACUUM, etc.) - DuckLake doesn't support these
+	// (determined by transpiler during Parse)
+	if p.stmt.isNoOp {
+		log.Printf("[%s] No-op command (DuckLake limitation): %s", c.username, p.stmt.query)
+		writeCommandComplete(c.writer, p.stmt.noOpTag)
+		return
+	}
+
+	if !returnsResults {
+		// Handle nested BEGIN: PostgreSQL issues a warning but continues,
+		// while DuckDB throws an error. Match PostgreSQL behavior.
+		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
+			c.sendNotice("WARNING", "25001", "there is already a transaction in progress")
+			writeCommandComplete(c.writer, "BEGIN")
+			return
+		}
+
+		// Non-result-returning query: use Exec with converted query
 		result, err := c.db.Exec(p.stmt.convertedQuery, args...)
 		if err != nil {
+			log.Printf("[%s] Execute error: %v", c.username, err)
 			c.sendError("ERROR", "42000", err.Error())
 			c.setTxError()
 			return
@@ -1241,9 +1501,10 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	}
 
-	// SELECT: use Query with converted query
+	// Result-returning query: use Query with converted query
 	rows, err := c.db.Query(p.stmt.convertedQuery, args...)
 	if err != nil {
+		log.Printf("[%s] Query error: %v", c.username, err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		return
@@ -1252,6 +1513,7 @@ func (c *clientConn) handleExecute(body []byte) {
 
 	cols, err := rows.Columns()
 	if err != nil {
+		log.Printf("[%s] Columns error: %v", c.username, err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		return
@@ -1355,20 +1617,4 @@ func readCString(r *bytes.Reader) (string, error) {
 		buf.WriteByte(b)
 	}
 	return buf.String(), nil
-}
-
-// convertPlaceholders converts PostgreSQL $1, $2 placeholders to ?
-// Returns the converted query and the number of parameters found
-func convertPlaceholders(query string) (string, int) {
-	result := query
-	count := 0
-	for i := 1; i <= 100; i++ {
-		placeholder := fmt.Sprintf("$%d", i)
-		if !strings.Contains(result, placeholder) {
-			break
-		}
-		result = strings.Replace(result, placeholder, "?", 1)
-		count++
-	}
-	return result, count
 }
