@@ -73,6 +73,7 @@ func initPgCatalog(db *sql.DB) error {
 			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
 			'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
 			'pg_stat_user_tables', 'pg_stat_statements', 'pg_partitioned_table',
+			'pg_attribute',
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', '__duckgres_column_metadata'
 		)
@@ -325,6 +326,53 @@ func initPgCatalog(db *sql.DB) error {
 		FROM pg_catalog.pg_namespace
 	`
 	db.Exec(pgNamespaceSQL)
+
+	// Create pg_attribute wrapper that fixes NUMERIC/DECIMAL type OIDs
+	// DuckDB's pg_catalog.pg_attribute returns atttypid=21 (int2) for DECIMAL columns
+	// but JDBC clients expect atttypid=1700 (numeric). This view fixes that mapping
+	// by joining with duckdb_columns() to get the actual type name.
+	pgAttributeSQL := `
+		CREATE OR REPLACE VIEW pg_attribute AS
+		SELECT
+			a.attrelid,
+			a.attname,
+			-- Fix atttypid: DECIMAL/NUMERIC should be 1700, not 21
+			-- Use duckdb_columns() to get actual type since pg_type shows 'int2' for DECIMAL
+			CASE
+				WHEN dc.data_type LIKE 'DECIMAL%' OR dc.data_type LIKE 'NUMERIC%' THEN 1700::BIGINT
+				ELSE a.atttypid
+			END AS atttypid,
+			a.attstattarget,
+			-- Fix attlen: DECIMAL/NUMERIC is variable-length (-1)
+			CASE
+				WHEN dc.data_type LIKE 'DECIMAL%' OR dc.data_type LIKE 'NUMERIC%' THEN -1::INTEGER
+				ELSE a.attlen
+			END AS attlen,
+			a.attnum,
+			a.attndims,
+			a.attcacheoff,
+			a.atttypmod,
+			a.attbyval,
+			a.attalign,
+			a.attstorage,
+			a.attcompression,
+			a.attnotnull,
+			a.atthasdef,
+			a.atthasmissing,
+			a.attidentity,
+			a.attgenerated,
+			a.attisdropped,
+			a.attislocal,
+			a.attinhcount,
+			a.attcollation,
+			a.attacl,
+			a.attoptions,
+			a.attfdwoptions,
+			a.attmissingval
+		FROM pg_catalog.pg_attribute a
+		LEFT JOIN duckdb_columns() dc ON dc.table_oid = a.attrelid AND dc.column_name = a.attname
+	`
+	db.Exec(pgAttributeSQL)
 
 	// Create helper macros/functions that psql expects but DuckDB doesn't have
 	// These need to be created without schema prefix so DuckDB finds them
@@ -680,7 +728,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			'pg_class_full', 'pg_collation', 'pg_database', 'pg_inherits',
 			'pg_namespace', 'pg_policy', 'pg_publication', 'pg_publication_rel',
 			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext', 'pg_matviews',
-			'pg_stat_user_tables',
+			'pg_stat_user_tables', 'pg_stat_statements', 'pg_partitioned_table', 'pg_attribute',
 			-- information_schema compat views
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', 'information_schema_views_compat'
@@ -743,7 +791,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			'pg_class_full', 'pg_collation', 'pg_database', 'pg_inherits',
 			'pg_namespace', 'pg_policy', 'pg_publication', 'pg_publication_rel',
 			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext', 'pg_matviews',
-			'pg_stat_user_tables',
+			'pg_stat_user_tables', 'pg_stat_statements', 'pg_partitioned_table', 'pg_attribute',
 			-- information_schema compat views
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', 'information_schema_views_compat'
@@ -810,6 +858,7 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
 			'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
 			'pg_stat_user_tables', 'pg_stat_statements', 'pg_partitioned_table',
+			'pg_attribute',
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', '__duckgres_column_metadata'
 		  )
@@ -859,6 +908,7 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
 			'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
 			'pg_stat_user_tables', 'pg_stat_statements', 'pg_partitioned_table',
+			'pg_attribute',
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', '__duckgres_column_metadata'
 		  )
