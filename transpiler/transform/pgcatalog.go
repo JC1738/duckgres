@@ -47,6 +47,8 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"pg_inherits":           "pg_inherits",
 			"pg_matviews":           "pg_matviews",
 			"pg_stat_user_tables":   "pg_stat_user_tables",
+			"pg_stat_statements":    "pg_stat_statements",
+			"pg_partitioned_table":  "pg_partitioned_table",
 			"pg_type":               "pg_type",
 			"pg_attribute":          "pg_attribute",
 		},
@@ -63,12 +65,14 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"pg_get_constraintdef":            true,
 			"pg_get_partkeydef":               true,
 			"pg_get_statisticsobjdef_columns": true,
+			"pg_get_serial_sequence":          true,
 			"pg_relation_is_publishable":      true,
 			"current_setting":                 true,
 			"pg_is_in_recovery":               true,
 			"has_schema_privilege":            true,
 			"has_table_privilege":             true,
 			"array_to_string":                 true,
+			"version":                         true,
 		},
 		// Our custom macros that are created in memory.main and need explicit qualification
 		// in DuckLake mode. These are NOT built-in DuckDB pg_catalog functions.
@@ -79,8 +83,10 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"pg_is_in_recovery":               true,
 			"pg_relation_is_publishable":      true,
 			"pg_get_statisticsobjdef_columns": true,
+			"pg_get_serial_sequence":          true, // Returns NULL - DuckDB doesn't support identity columns
 			"shobj_description":               true,
 			"current_setting":                 true, // Override DuckDB's built-in with our PostgreSQL-compatible version
+			"version":                         true, // PostgreSQL-compatible version string for SQLAlchemy
 		},
 	}
 }

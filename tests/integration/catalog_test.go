@@ -305,6 +305,28 @@ func TestCatalogSystemFunctions(t *testing.T) {
 	runQueryTests(t, tests)
 }
 
+// TestCatalogPgGetSerialSequence tests pg_get_serial_sequence function
+// In DuckLake mode, sequences are not supported, so pg_get_serial_sequence
+// should always return NULL (which is correct behavior - no sequences exist)
+func TestCatalogPgGetSerialSequence(t *testing.T) {
+	tests := []QueryTest{
+		// Test that pg_get_serial_sequence returns NULL for non-serial columns
+		// In DuckLake mode, this is always NULL since sequences aren't supported
+		{
+			Name:         "pg_get_serial_sequence_returns_null",
+			Query:        "SELECT pg_get_serial_sequence('users', 'id') IS NULL",
+			DuckgresOnly: true,
+		},
+		// Test with non-existent table (should return NULL, not error)
+		{
+			Name:         "pg_get_serial_sequence_nonexistent_table",
+			Query:        "SELECT pg_get_serial_sequence('nonexistent_table', 'id') IS NULL",
+			DuckgresOnly: true,
+		},
+	}
+	runQueryTests(t, tests)
+}
+
 // TestCatalogCombinedQueries tests more complex catalog queries
 func TestCatalogCombinedQueries(t *testing.T) {
 	tests := []QueryTest{
@@ -393,6 +415,16 @@ func TestCatalogStubs(t *testing.T) {
 		{
 			Name:         "pg_matviews_unqualified",
 			Query:        "SELECT * FROM pg_matviews LIMIT 5",
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "pg_stat_statements",
+			Query:        "SELECT * FROM pg_catalog.pg_stat_statements LIMIT 5",
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "pg_partitioned_table",
+			Query:        "SELECT * FROM pg_catalog.pg_partitioned_table LIMIT 5",
 			DuckgresOnly: true,
 		},
 	}
