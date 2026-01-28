@@ -19,6 +19,26 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 - **Rate Limiting**: Built-in protection against brute-force attacks
 - **Graceful Shutdown**: Waits for in-flight queries before exiting
 - **Flexible Configuration**: YAML config files, environment variables, and CLI flags
+- **Prometheus Metrics**: Built-in metrics endpoint for monitoring
+
+## Metrics
+
+Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is currently fixed at 9090 and cannot be changed via configuration.
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `duckgres_connections_open` | Gauge | Number of currently open client connections |
+| `duckgres_query_duration_seconds` | Histogram | Query execution duration (includes `_count`, `_sum`, `_bucket`) |
+| `duckgres_query_errors_total` | Counter | Total number of failed queries |
+| `duckgres_auth_failures_total` | Counter | Total number of authentication failures |
+| `duckgres_rate_limit_rejects_total` | Counter | Total number of connections rejected due to rate limiting |
+| `duckgres_rate_limited_ips` | Gauge | Number of currently rate-limited IP addresses |
+
+### Testing Metrics
+
+- `scripts/test_metrics.sh` - Runs a quick sanity check (starts server, runs queries, verifies counts)
+- `scripts/load_generator.sh` - Generates continuous query load until Ctrl-C
+- `prometheus-docker-compose.yml` - Starts Prometheus locally to scrape metrics (UI at http://localhost:9091)
 
 ## Quick Start
 

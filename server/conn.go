@@ -533,6 +533,8 @@ func (c *clientConn) handleQuery(body []byte) error {
 		return nil
 	}
 
+	start := time.Now()
+	defer func() { queryDurationHistogram.Observe(time.Since(start).Seconds()) }()
 	slog.Debug("Query received.", "user", c.username, "query", query)
 
 	// Check for native_duckdb commands BEFORE transpiling
@@ -1777,6 +1779,16 @@ func formatValue(v interface{}) string {
 }
 
 func (c *clientConn) sendError(severity, code, message string) {
+	// Class 28 = "Invalid Authorization Specification" (auth failures).
+	// All current FATAL errors use class 28, so this covers both auth
+	// failures and connection rejections (no SSL, no user, wrong password).
+	// NOTE: If one adds a FATAL error with a non-28 code, be sure to add
+	// a metric for it here.
+	if strings.HasPrefix(code, "28") {
+		authFailuresCounter.Inc()
+	} else if severity == "ERROR" {
+		queryErrorsCounter.Inc()
+	}
 	_ = writeErrorResponse(c.writer, severity, code, message)
 	_ = c.writer.Flush()
 }
@@ -2170,6 +2182,16 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	}
 
+	// Handle empty queries - PostgreSQL returns EmptyQueryResponse for these
+	trimmedQuery := strings.TrimSpace(p.stmt.query)
+	if trimmedQuery == "" || isEmptyQuery(trimmedQuery) {
+		_ = writeEmptyQueryResponse(c.writer)
+		return
+	}
+
+	start := time.Now()
+	defer func() { queryDurationHistogram.Observe(time.Since(start).Seconds()) }()
+
 	// Convert parameter values to interface{}, handling binary format
 	args, err := p.decodeParams()
 	if err != nil {
@@ -2183,13 +2205,6 @@ func (c *clientConn) handleExecute(body []byte) {
 	returnsResults := queryReturnsResults(p.stmt.query)
 
 	slog.Debug("Execute portal.", "user", c.username, "portal", portalName, "params", len(args), "query", p.stmt.query)
-
-	// Handle empty queries - PostgreSQL returns EmptyQueryResponse for these
-	trimmedQuery := strings.TrimSpace(p.stmt.query)
-	if trimmedQuery == "" || isEmptyQuery(trimmedQuery) {
-		_ = writeEmptyQueryResponse(c.writer)
-		return
-	}
 
 	// Check if this is a native_duckdb command (prepared via extended protocol)
 	switch p.stmt.noOpTag {

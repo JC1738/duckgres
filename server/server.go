@@ -13,10 +13,43 @@ import (
 	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
 // redactConnectionString removes sensitive information (passwords) from connection strings for logging
 var passwordPattern = regexp.MustCompile(`(?i)(password\s*[=:]\s*)([^\s]+)`)
+
+var connectionsGauge = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "duckgres_connections_open",
+	Help: "Number of currently open client connections",
+})
+
+var queryDurationHistogram = promauto.NewHistogram(prometheus.HistogramOpts{
+	Name:    "duckgres_query_duration_seconds",
+	Help:    "Query execution duration in seconds",
+	Buckets: prometheus.DefBuckets,
+})
+
+var queryErrorsCounter = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_query_errors_total",
+	Help: "Total number of failed queries",
+})
+
+var authFailuresCounter = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_auth_failures_total",
+	Help: "Total number of authentication failures",
+})
+
+var rateLimitRejectsCounter = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_rate_limit_rejects_total",
+	Help: "Total number of connections rejected due to rate limiting",
+})
+
+var rateLimitedIPsGauge = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "duckgres_rate_limited_ips",
+	Help: "Number of currently rate-limited IP addresses",
+})
 
 func redactConnectionString(connStr string) string {
 	return passwordPattern.ReplaceAllString(connStr, "${1}[REDACTED]")
@@ -585,14 +618,11 @@ func (s *Server) buildCredentialChainSecret() string {
 func (s *Server) handleConnection(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr()
 
-	// Track active connections
-	atomic.AddInt64(&s.activeConns, 1)
-	defer atomic.AddInt64(&s.activeConns, -1)
-
 	// Check rate limiting before doing anything
 	if msg := s.rateLimiter.CheckConnection(remoteAddr); msg != "" {
 		// Send PostgreSQL error and close
 		slog.Warn("Connection rejected.", "remote_addr", remoteAddr, "reason", msg)
+		rateLimitRejectsCounter.Inc()
 		_ = conn.Close()
 		return
 	}
@@ -600,9 +630,18 @@ func (s *Server) handleConnection(conn net.Conn) {
 	// Register this connection
 	if !s.rateLimiter.RegisterConnection(remoteAddr) {
 		slog.Warn("Connection rejected: rate limit exceeded.", "remote_addr", remoteAddr)
+		rateLimitRejectsCounter.Inc()
 		_ = conn.Close()
 		return
 	}
+
+	// Track active connections (only after rate limiting passes)
+	atomic.AddInt64(&s.activeConns, 1)
+	connectionsGauge.Inc()
+	defer func() {
+		atomic.AddInt64(&s.activeConns, -1)
+		connectionsGauge.Dec()
+	}()
 
 	// Ensure we unregister when done
 	defer func() {
