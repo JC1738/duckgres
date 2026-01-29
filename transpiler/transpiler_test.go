@@ -1552,6 +1552,184 @@ func TestCountParameters(t *testing.T) {
 	}
 }
 
+func TestTranspile_FallbackToNative(t *testing.T) {
+	// Test that FallbackToNative is set correctly when PostgreSQL parsing fails
+	// but the query might be valid DuckDB syntax
+	tr := New(DefaultConfig())
+
+	tests := []struct {
+		name             string
+		input            string
+		wantFallback     bool
+		wantSQL          string // expected SQL in result (original for fallback)
+		wantErrNil       bool   // whether err should be nil
+	}{
+		{
+			name:         "valid PostgreSQL - no fallback",
+			input:        "SELECT * FROM users",
+			wantFallback: false,
+			wantErrNil:   true,
+		},
+		{
+			name:         "valid PostgreSQL with WHERE - no fallback",
+			input:        "SELECT id, name FROM users WHERE active = true",
+			wantFallback: false,
+			wantErrNil:   true,
+		},
+		{
+			name:         "valid PostgreSQL INSERT - no fallback",
+			input:        "INSERT INTO users (name) VALUES ('test')",
+			wantFallback: false,
+			wantErrNil:   true,
+		},
+		// Note: COPY syntax is valid PostgreSQL, so it doesn't trigger fallback
+		// even if the FORMAT PARQUET is DuckDB-specific
+		{
+			name:         "DuckDB DESCRIBE statement - fallback",
+			input:        "DESCRIBE SELECT * FROM users",
+			wantFallback: true,
+			wantSQL:      "DESCRIBE SELECT * FROM users",
+			wantErrNil:   true,
+		},
+		{
+			name:         "DuckDB SUMMARIZE statement - fallback",
+			input:        "SUMMARIZE SELECT * FROM users",
+			wantFallback: true,
+			wantSQL:      "SUMMARIZE SELECT * FROM users",
+			wantErrNil:   true,
+		},
+		{
+			name:         "DuckDB PIVOT syntax - fallback",
+			input:        "PIVOT cities ON year USING sum(population)",
+			wantFallback: true,
+			wantSQL:      "PIVOT cities ON year USING sum(population)",
+			wantErrNil:   true,
+		},
+		{
+			name:         "DuckDB UNPIVOT syntax - fallback",
+			input:        "UNPIVOT monthly_sales ON jan, feb, mar INTO NAME month VALUE sales",
+			wantFallback: true,
+			wantSQL:      "UNPIVOT monthly_sales ON jan, feb, mar INTO NAME month VALUE sales",
+			wantErrNil:   true,
+		},
+		{
+			name:         "DuckDB FROM-first syntax - fallback",
+			input:        "FROM users SELECT name, email",
+			wantFallback: true,
+			wantSQL:      "FROM users SELECT name, email",
+			wantErrNil:   true,
+		},
+		// Note: read_parquet() and read_csv() are valid PostgreSQL syntax
+		// (just function calls), so they don't trigger fallback.
+		// They only fail at execution time if the function doesn't exist.
+		{
+			name:         "DuckDB INSTALL extension - fallback",
+			input:        "INSTALL httpfs",
+			wantFallback: true,
+			wantSQL:      "INSTALL httpfs",
+			wantErrNil:   true,
+		},
+		{
+			name:         "DuckDB LOAD extension - fallback",
+			input:        "LOAD httpfs",
+			wantFallback: true,
+			wantSQL:      "LOAD httpfs",
+			wantErrNil:   true,
+		},
+		{
+			name:         "DuckDB ATTACH database - fallback",
+			input:        "ATTACH 'my.db' AS mydb",
+			wantFallback: true,
+			wantSQL:      "ATTACH 'my.db' AS mydb",
+			wantErrNil:   true,
+		},
+		{
+			name:         "DuckDB USE database - fallback",
+			input:        "USE mydb",
+			wantFallback: true,
+			wantSQL:      "USE mydb",
+			wantErrNil:   true,
+		},
+		{
+			name:         "DuckDB PRAGMA statement - fallback",
+			input:        "PRAGMA database_list",
+			wantFallback: true,
+			wantSQL:      "PRAGMA database_list",
+			wantErrNil:   true,
+		},
+		{
+			name:         "DuckDB CREATE MACRO - fallback",
+			input:        "CREATE MACRO add(a, b) AS a + b",
+			wantFallback: true,
+			wantSQL:      "CREATE MACRO add(a, b) AS a + b",
+			wantErrNil:   true,
+		},
+		{
+			name:         "DuckDB SELECT with EXCLUDE - fallback",
+			input:        "SELECT * EXCLUDE (password) FROM users",
+			wantFallback: true,
+			wantSQL:      "SELECT * EXCLUDE (password) FROM users",
+			wantErrNil:   true,
+		},
+		{
+			name:         "DuckDB SELECT with REPLACE - fallback",
+			input:        "SELECT * REPLACE (upper(name) AS name) FROM users",
+			wantFallback: true,
+			wantSQL:      "SELECT * REPLACE (upper(name) AS name) FROM users",
+			wantErrNil:   true,
+		},
+		{
+			name:         "DuckDB QUALIFY clause - fallback",
+			input:        "SELECT * FROM sales QUALIFY row_number() OVER (PARTITION BY region) = 1",
+			wantFallback: true,
+			wantSQL:      "SELECT * FROM sales QUALIFY row_number() OVER (PARTITION BY region) = 1",
+			wantErrNil:   true,
+		},
+		{
+			name:         "valid PostgreSQL CTE - no fallback",
+			input:        "WITH cte AS (SELECT 1) SELECT * FROM cte",
+			wantFallback: false,
+			wantErrNil:   true,
+		},
+		{
+			name:         "valid PostgreSQL subquery - no fallback",
+			input:        "SELECT * FROM (SELECT id FROM users) AS sub",
+			wantFallback: false,
+			wantErrNil:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+
+			// Check error expectation
+			if tt.wantErrNil && err != nil {
+				t.Fatalf("Transpile(%q) unexpected error: %v", tt.input, err)
+			}
+			if !tt.wantErrNil && err == nil {
+				t.Fatalf("Transpile(%q) expected error, got nil", tt.input)
+			}
+
+			if err != nil {
+				return
+			}
+
+			// Check FallbackToNative flag
+			if result.FallbackToNative != tt.wantFallback {
+				t.Errorf("Transpile(%q) FallbackToNative = %v, want %v",
+					tt.input, result.FallbackToNative, tt.wantFallback)
+			}
+
+			// For fallback cases, SQL should be the original query
+			if tt.wantFallback && tt.wantSQL != "" && result.SQL != tt.wantSQL {
+				t.Errorf("Transpile(%q) SQL = %q, want %q",
+					tt.input, result.SQL, tt.wantSQL)
+			}
+		})
+	}
+}
+
 func TestConvertAlterTableToAlterView(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -1626,6 +1804,65 @@ func TestConvertAlterTableToAlterView(t *testing.T) {
 				if result != tt.input {
 					t.Errorf("ConvertAlterTableToAlterView(%q) = %q, should return original", tt.input, result)
 				}
+			}
+		})
+	}
+}
+
+func TestTranspile_FallbackParamCount(t *testing.T) {
+	// Test that when pg_query fails to parse DuckDB-specific syntax,
+	// the transpiler still correctly counts $N parameter placeholders
+	// using regex-based counting.
+	tests := []struct {
+		name       string
+		input      string
+		paramCount int
+	}{
+		{
+			name:       "DuckDB FROM-first with parameter",
+			input:      "FROM users SELECT name WHERE id = $1",
+			paramCount: 1,
+		},
+		{
+			name:       "DuckDB SELECT EXCLUDE with parameter",
+			input:      "SELECT * EXCLUDE (email) FROM users WHERE id = $1",
+			paramCount: 1,
+		},
+		{
+			name:       "DuckDB DESCRIBE with no params",
+			input:      "DESCRIBE SELECT 1 AS num",
+			paramCount: 0,
+		},
+		{
+			name:       "DuckDB QUALIFY with multiple params",
+			input:      "SELECT id, name FROM users WHERE status = $1 QUALIFY row_number() OVER (ORDER BY id) <= $2",
+			paramCount: 2,
+		},
+		{
+			name:       "DuckDB list_filter with param",
+			input:      "SELECT list_filter([1, 2, 3, 4, 5], x -> x > $1) AS filtered",
+			paramCount: 1,
+		},
+		{
+			name:       "Out of order params",
+			input:      "FROM users SELECT $3, $1, $2",
+			paramCount: 3,
+		},
+	}
+
+	tr := New(Config{ConvertPlaceholders: true})
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if !result.FallbackToNative {
+				t.Errorf("Transpile(%q) should set FallbackToNative=true for DuckDB-specific syntax", tt.input)
+			}
+			if result.ParamCount != tt.paramCount {
+				t.Errorf("Transpile(%q) ParamCount = %d, want %d", tt.input, result.ParamCount, tt.paramCount)
 			}
 		})
 	}
